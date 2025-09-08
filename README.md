@@ -69,7 +69,7 @@ Ensure you have the following installed:
           )
 
           answer = brain.ask(
-              "what is gold? asnwer in french"
+              "what is gold? answer in french"
           )
           print("answer:", answer)
   ```
