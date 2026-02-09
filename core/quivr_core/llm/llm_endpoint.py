@@ -291,6 +291,17 @@ class LLMEndpoint:
                     max_tokens=config.max_output_tokens,
                     temperature=config.temperature,
                 )
+            elif config.supplier == DefaultModelSuppliers.FORGE:
+                _llm = ChatOpenAI(
+                    model=config.model,
+                    api_key=SecretStr(config.llm_api_key)
+                    if config.llm_api_key
+                    else None,
+                    base_url=config.llm_base_url
+                    or "https://api.forge.tensorblock.co/v1",
+                    max_completion_tokens=config.max_output_tokens,
+                    temperature=config.temperature,
+                )
 
             else:
                 _llm = ChatOpenAI(

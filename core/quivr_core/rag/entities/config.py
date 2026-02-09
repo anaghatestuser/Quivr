@@ -75,6 +75,7 @@ class DefaultModelSuppliers(str, Enum):
     MISTRAL = "mistral"
     GROQ = "groq"
     GEMINI = "gemini"
+    FORGE = "forge"
 
 
 class LLMConfig(QuivrBaseConfig):
