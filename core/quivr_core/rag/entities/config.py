@@ -360,9 +360,9 @@ class LLMEndpointConfig(QuivrBaseConfig):
             self.llm_api_key = os.getenv(self.env_variable_name)
 
         if not self.llm_api_key:
-            logger.warning(f"The API key for supplier '{self.supplier}' is not set. ")
-            logger.warning(
-                f"Please set the environment variable: '{self.env_variable_name}'. "
+            raise ValueError(
+                f"The API key for supplier '{self.supplier}' is not set. "
+                f"Please set the environment variable: '{self.env_variable_name}'."
             )
 
     def set_llm_model_config(self):

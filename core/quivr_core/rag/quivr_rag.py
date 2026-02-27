@@ -158,7 +158,7 @@ class QuivrQARAG:
 
         return loaded_memory | standalone_question | retrieved_documents | answer
 
-    def answer(
+    async def answer(
         self,
         question: str,
         history: ChatHistory,
@@ -166,13 +166,13 @@ class QuivrQARAG:
         metadata: dict[str, str] = {},
     ) -> ParsedRAGResponse:
         """
-        Answers a question using the QuivrQA RAG synchronously.
+        Answers a question using the QuivrQA RAG asynchronously.
         """
         concat_list_files = format_file_list(
             list_files, self.retrieval_config.max_files
         )
         conversational_qa_chain = self.build_chain(concat_list_files)
-        raw_llm_response = conversational_qa_chain.invoke(
+        raw_llm_response = await conversational_qa_chain.ainvoke(
             {
                 "question": question,
                 "chat_history": history,
