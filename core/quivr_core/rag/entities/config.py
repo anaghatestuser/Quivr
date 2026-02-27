@@ -75,6 +75,7 @@ class DefaultModelSuppliers(str, Enum):
     MISTRAL = "mistral"
     GROQ = "groq"
     GEMINI = "gemini"
+    AVIAN = "avian"
 
 
 class LLMConfig(QuivrBaseConfig):
@@ -273,6 +274,24 @@ class LLMModelConfig:
                 max_context_tokens=128000,
                 max_output_tokens=4096,
                 tokenizer_hub="Quivr/gemini-tokenizer",
+            ),
+        },
+        DefaultModelSuppliers.AVIAN: {
+            "deepseek/deepseek-v3.2": LLMConfig(
+                max_context_tokens=164000,
+                max_output_tokens=65000,
+            ),
+            "moonshotai/kimi-k2.5": LLMConfig(
+                max_context_tokens=131000,
+                max_output_tokens=8192,
+            ),
+            "z-ai/glm-5": LLMConfig(
+                max_context_tokens=131000,
+                max_output_tokens=16384,
+            ),
+            "minimax/minimax-m2.5": LLMConfig(
+                max_context_tokens=1000000,
+                max_output_tokens=1000000,
             ),
         },
     }
