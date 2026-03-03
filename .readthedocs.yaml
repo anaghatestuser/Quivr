@@ -14,8 +14,8 @@ build:
     - asdf install uv latest
     - asdf global uv latest
     - uv venv
-    - sed -i "s|file:///\${PROJECT_ROOT}/\.\./core|file://$PWD/core|g" docs/requirements.lock
-    - cd docs && UV_INDEX_STRATEGY=unsafe-first-match uv pip install -r requirements.lock
+    - .venv/bin/python -m pip install ./core
+    - grep -v '^quivr-core' docs/requirements.lock > /tmp/requirements-filtered.lock && cd docs && UV_INDEX_STRATEGY=unsafe-first-match uv pip install -r /tmp/requirements-filtered.lock
     - cd docs/ && ls -la && NO_COLOR=1 ../.venv/bin/mkdocs build --strict --site-dir $READTHEDOCS_OUTPUT/html --config-file mkdocs.yml
 
 
