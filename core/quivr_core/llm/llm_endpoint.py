@@ -238,6 +238,7 @@ class LLMEndpoint:
                     azure_endpoint=azure_endpoint,
                     max_tokens=config.max_output_tokens,
                     temperature=config.temperature,
+                    timeout=60,
                 )
             elif config.supplier == DefaultModelSuppliers.ANTHROPIC:
                 assert config.llm_api_key, "Can't load model config"
@@ -247,7 +248,7 @@ class LLMEndpoint:
                     base_url=config.llm_base_url,
                     max_tokens_to_sample=config.max_output_tokens,
                     temperature=config.temperature,
-                    timeout=None,
+                    timeout=60,
                     stop=None,
                 )
             elif config.supplier == DefaultModelSuppliers.OPENAI:
@@ -261,6 +262,7 @@ class LLMEndpoint:
                     temperature=config.temperature
                     if not config.model.startswith("o")
                     else None,
+                    timeout=60,
                 )
             elif config.supplier == DefaultModelSuppliers.MISTRAL:
                 _llm = ChatMistralAI(
@@ -270,6 +272,7 @@ class LLMEndpoint:
                     else None,
                     base_url=config.llm_base_url,
                     temperature=config.temperature,
+                    timeout=60,
                 )
             elif config.supplier == DefaultModelSuppliers.GEMINI:
                 _llm = ChatGoogleGenerativeAI(
@@ -280,6 +283,7 @@ class LLMEndpoint:
                     base_url=config.llm_base_url,
                     max_tokens=config.max_output_tokens,
                     temperature=config.temperature,
+                    timeout=60,
                 )
             elif config.supplier == DefaultModelSuppliers.GROQ:
                 _llm = ChatGroq(
@@ -290,6 +294,7 @@ class LLMEndpoint:
                     base_url=config.llm_base_url,
                     max_tokens=config.max_output_tokens,
                     temperature=config.temperature,
+                    timeout=60,
                 )
 
             else:
@@ -301,6 +306,7 @@ class LLMEndpoint:
                     base_url=config.llm_base_url,
                     max_completion_tokens=config.max_output_tokens,
                     temperature=config.temperature,
+                    timeout=60,
                 )
             instance = cls(llm=_llm, llm_config=config)
             cls._cache[hashed_config] = instance
