@@ -109,7 +109,7 @@ async def main(message: cl.Message):
     await cl.sleep(1)
     await task_list.remove()
 
-async_openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+async_openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"), timeout=60.0, max_retries=3)
 
 @cl.step(type="tool", name="Speech to text")
 async def speech_to_text(audio_file):
