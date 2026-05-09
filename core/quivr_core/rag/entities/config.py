@@ -75,6 +75,8 @@ class DefaultModelSuppliers(str, Enum):
     MISTRAL = "mistral"
     GROQ = "groq"
     GEMINI = "gemini"
+    ASTRAFLOW = "astraflow"
+    ASTRAFLOW_CN = "astraflow_cn"
 
 
 class LLMConfig(QuivrBaseConfig):
@@ -273,6 +275,39 @@ class LLMModelConfig:
                 max_context_tokens=128000,
                 max_output_tokens=4096,
                 tokenizer_hub="Quivr/gemini-tokenizer",
+            ),
+        },
+        # Astraflow (UCloud / 优刻得) — OpenAI-compatible aggregation platform
+        # supporting 200+ models.
+        # Global endpoint: https://api-us-ca.umodelverse.ai/v1 (env: ASTRAFLOW_API_KEY)
+        # China endpoint:  https://api.modelverse.cn/v1        (env: ASTRAFLOW_CN_API_KEY)
+        DefaultModelSuppliers.ASTRAFLOW: {
+            "gpt-4o": LLMConfig(
+                max_context_tokens=128000,
+                max_output_tokens=16384,
+                tokenizer_hub="Quivr/gpt-4o",
+            ),
+            "gpt-4o-mini": LLMConfig(
+                max_context_tokens=128000,
+                max_output_tokens=16384,
+                tokenizer_hub="Quivr/gpt-4o",
+            ),
+            "claude-3-5-sonnet": LLMConfig(
+                max_context_tokens=200000,
+                max_output_tokens=8192,
+                tokenizer_hub="Quivr/claude-tokenizer",
+            ),
+        },
+        DefaultModelSuppliers.ASTRAFLOW_CN: {
+            "gpt-4o": LLMConfig(
+                max_context_tokens=128000,
+                max_output_tokens=16384,
+                tokenizer_hub="Quivr/gpt-4o",
+            ),
+            "gpt-4o-mini": LLMConfig(
+                max_context_tokens=128000,
+                max_output_tokens=16384,
+                tokenizer_hub="Quivr/gpt-4o",
             ),
         },
     }
