@@ -19,6 +19,8 @@ from quivr_core.rag.utils import model_supports_function_calling
 
 logger = logging.getLogger("quivr_core")
 
+ORCAROUTER_DEFAULT_BASE_URL = "https://api.orcarouter.ai/v1"
+
 
 class LLMTokenizer:
     _cache: dict[
@@ -281,6 +283,30 @@ class LLMEndpoint:
                     max_tokens=config.max_output_tokens,
                     temperature=config.temperature,
                 )
+            elif config.supplier == DefaultModelSuppliers.ORCAROUTER:
+                # OrcaRouter is OpenAI-compatible. Default the base URL when
+                # the caller didn't override it. We do NOT mutate the config
+                # here — mutating it after hash(config) has been computed
+                # would corrupt the cache key on subsequent calls. info()
+                # reads the same default via _effective_base_url().
+                base_url = config.llm_base_url or ORCAROUTER_DEFAULT_BASE_URL
+                # Reasoning models (Claude Opus 4.7, OpenAI gpt-5*, DeepSeek
+                # reasoners) reject `temperature` upstream, so we pass None.
+                model_lower = config.model.lower()
+                is_reasoning = (
+                    model_lower.startswith("anthropic/claude-opus-4.7")
+                    or model_lower.startswith("openai/gpt-5")
+                    or "deepseek-reasoner" in model_lower
+                )
+                _llm = ChatOpenAI(
+                    model=config.model,
+                    api_key=SecretStr(config.llm_api_key)
+                    if config.llm_api_key
+                    else None,
+                    base_url=base_url,
+                    max_completion_tokens=config.max_output_tokens,
+                    temperature=None if is_reasoning else config.temperature,
+                )
             elif config.supplier == DefaultModelSuppliers.GROQ:
                 _llm = ChatGroq(
                     model=config.model,
@@ -315,12 +341,17 @@ class LLMEndpoint:
     def supports_func_calling(self) -> bool:
         return self._supports_func_calling
 
+    def _effective_base_url(self) -> str:
+        if self._config.llm_base_url:
+            return self._config.llm_base_url
+        if self._config.supplier == DefaultModelSuppliers.ORCAROUTER:
+            return ORCAROUTER_DEFAULT_BASE_URL
+        return "openai"
+
     def info(self) -> LLMInfo:
         return LLMInfo(
             model=self._config.model,
-            llm_base_url=(
-                self._config.llm_base_url if self._config.llm_base_url else "openai"
-            ),
+            llm_base_url=self._effective_base_url(),
             temperature=self._config.temperature,
             max_tokens=self._config.max_output_tokens,
             supports_function_calling=self.supports_func_calling(),
