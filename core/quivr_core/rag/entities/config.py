@@ -75,6 +75,7 @@ class DefaultModelSuppliers(str, Enum):
     MISTRAL = "mistral"
     GROQ = "groq"
     GEMINI = "gemini"
+    ORCAROUTER = "orcarouter"
 
 
 class LLMConfig(QuivrBaseConfig):
@@ -273,6 +274,56 @@ class LLMModelConfig:
                 max_context_tokens=128000,
                 max_output_tokens=4096,
                 tokenizer_hub="Quivr/gemini-tokenizer",
+            ),
+        },
+        # OrcaRouter (https://www.orcarouter.ai) — OpenAI-compatible
+        # multi-vendor routing gateway. Models are exposed under
+        # "<vendor>/<model>" IDs and routed to the appropriate upstream.
+        # The synthetic "orcarouter/auto" entry maps to an admin-configurable
+        # routing policy (cheapest / balanced / quality / adaptive).
+        # See https://docs.orcarouter.ai for the full catalog and routing
+        # docs; the entries below cover the flagship models — any other
+        # model ID is accepted as a free-form string.
+        DefaultModelSuppliers.ORCAROUTER: {
+            "orcarouter/auto": LLMConfig(
+                max_context_tokens=128000,
+                max_output_tokens=16384,
+                tokenizer_hub="Quivr/gpt-4o",
+            ),
+            "openai/gpt-5": LLMConfig(
+                max_context_tokens=400000,
+                max_output_tokens=32768,
+                tokenizer_hub="Quivr/gpt-4o",
+            ),
+            "google/gemini-3.1-pro-preview": LLMConfig(
+                max_context_tokens=1048576,
+                max_output_tokens=8192,
+                tokenizer_hub="Quivr/gemini-tokenizer",
+            ),
+            "anthropic/claude-opus-4.7": LLMConfig(
+                max_context_tokens=200000,
+                max_output_tokens=8192,
+                tokenizer_hub="Quivr/claude-tokenizer",
+            ),
+            "grok/grok-4.3": LLMConfig(
+                max_context_tokens=131072,
+                max_output_tokens=8192,
+                tokenizer_hub="Quivr/gpt-4o",
+            ),
+            "deepseek/deepseek-v4-flash": LLMConfig(
+                max_context_tokens=128000,
+                max_output_tokens=8192,
+                tokenizer_hub="Quivr/gpt-4o",
+            ),
+            "minimax/minimax-m2.7-highspeed": LLMConfig(
+                max_context_tokens=200000,
+                max_output_tokens=8192,
+                tokenizer_hub="Quivr/gpt-4o",
+            ),
+            "qwen/qwen3.6-plus": LLMConfig(
+                max_context_tokens=131072,
+                max_output_tokens=8192,
+                tokenizer_hub="Quivr/gpt-4o",
             ),
         },
     }
