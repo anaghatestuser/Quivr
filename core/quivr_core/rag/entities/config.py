@@ -75,6 +75,7 @@ class DefaultModelSuppliers(str, Enum):
     MISTRAL = "mistral"
     GROQ = "groq"
     GEMINI = "gemini"
+    MINIMAX = "minimax"
 
 
 class LLMConfig(QuivrBaseConfig):
@@ -273,6 +274,20 @@ class LLMModelConfig:
                 max_context_tokens=128000,
                 max_output_tokens=4096,
                 tokenizer_hub="Quivr/gemini-tokenizer",
+            ),
+        },
+        DefaultModelSuppliers.MINIMAX: {
+            "MiniMax-M3": LLMConfig(
+                max_context_tokens=512000,
+                max_output_tokens=128000,
+            ),
+            "MiniMax-M2.7-highspeed": LLMConfig(
+                max_context_tokens=204800,
+                max_output_tokens=192000,
+            ),
+            "MiniMax-M2.7": LLMConfig(
+                max_context_tokens=204800,
+                max_output_tokens=192000,
             ),
         },
     }

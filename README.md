@@ -13,7 +13,7 @@ Quivr, helps you build your second brain, utilizes the power of GenerativeAI to 
 ## Key Features 🎯
 
 - **Opiniated RAG**: We created a RAG that is opinionated, fast and efficient so you can focus on your product
-- **LLMs**: Quivr works with any LLM, you can use it with OpenAI, Anthropic, Mistral, Gemma, etc.
+- **LLMs**: Quivr works with any LLM, you can use it with OpenAI, Anthropic, Mistral, Gemini, Groq, MiniMax, etc.
 - **Any File**: Quivr works with any file, you can use it with PDF, TXT, Markdown, etc and even add your own parsers.
 - **Customize your RAG**: Quivr allows you to customize your RAG, add internet search, add tools, etc.
 - **Integrations with Megaparse**: Quivr works with [Megaparse](https://github.com/quivrhq/megaparse), so you can ingest your files with Megaparse and use the RAG with Quivr.
@@ -91,7 +91,7 @@ import os
 os.environ["OPENAI_API_KEY"] = "myopenai_apikey"
 
 ```
-Quivr supports APIs from Anthropic, OpenAI, and Mistral. It also supports local models using Ollama.
+Quivr supports APIs from Anthropic, OpenAI, Mistral, Gemini, Groq, and [MiniMax](https://www.minimax.io/). It also supports local models using Ollama.
 
 1. Create the YAML file ``basic_rag_workflow.yaml`` and copy the following content in it
 ```yaml
