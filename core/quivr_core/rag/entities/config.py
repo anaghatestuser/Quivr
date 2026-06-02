@@ -277,19 +277,15 @@ class LLMModelConfig:
             ),
         },
         DefaultModelSuppliers.MINIMAX: {
+            "MiniMax-M3": LLMConfig(
+                max_context_tokens=512000,
+                max_output_tokens=128000,
+            ),
             "MiniMax-M2.7-highspeed": LLMConfig(
                 max_context_tokens=204800,
                 max_output_tokens=192000,
             ),
             "MiniMax-M2.7": LLMConfig(
-                max_context_tokens=204800,
-                max_output_tokens=192000,
-            ),
-            "MiniMax-M2.5-highspeed": LLMConfig(
-                max_context_tokens=204800,
-                max_output_tokens=192000,
-            ),
-            "MiniMax-M2.5": LLMConfig(
                 max_context_tokens=204800,
                 max_output_tokens=192000,
             ),
