@@ -72,6 +72,7 @@ nav:
           - parsers/index.md
           - parsers/megaparse.md
           - parsers/simple.md
+          - parsers/twelvelabs.md
       - Vector Stores:
           - vectorstores/index.md
           - vectorstores/faiss.md
