@@ -119,6 +119,16 @@ def defaults_to_proc_entries(
                 priority=None,
             )
 
+    # Opt-in video ingestion via TwelveLabs Pegasus. Only loads when the
+    # `twelvelabs` extra is installed; otherwise it is skipped at resolution time.
+    _append_proc_mapping(
+        mapping=base_processors,
+        file_exts=[FileExtension.mp4, FileExtension.webm, FileExtension.mpeg],
+        cls_mod="quivr_core.processor.implementations.twelvelabs_processor.TwelveLabsVideoProcessor",
+        errtxt="can't import TwelveLabsVideoProcessor. Please install quivr-core[twelvelabs] to ingest videos with TwelveLabs Pegasus",
+        priority=None,
+    )
+
     # TODO(@aminediro): Megaparse should register itself
     # Append Megaparse
     _append_proc_mapping(
