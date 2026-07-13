@@ -191,7 +191,7 @@ class Brain:
             vector_db = FAISS.load_local(
                 folder_path=bserialized.vectordb_config.vectordb_folder_path,
                 embeddings=embedder,
-                allow_dangerous_deserialization=True,
+              
             )
         else:
             raise ValueError("Unsupported vectordb")
