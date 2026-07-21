@@ -4,7 +4,10 @@ from typing import Any, Dict, List, Tuple, no_type_check
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.messages.ai import AIMessageChunk
 from langchain_core.prompts import format_document
-from langfuse.callback import CallbackHandler
+try:
+    from langfuse.callback import CallbackHandler
+except ImportError:  # langfuse v3+/v4 moved the LangChain handler
+    from langfuse.langchain import CallbackHandler
 
 from quivr_core.rag.entities.config import WorkflowConfig
 from quivr_core.rag.entities.models import (

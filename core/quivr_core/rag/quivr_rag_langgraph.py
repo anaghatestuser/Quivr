@@ -1136,9 +1136,9 @@ class QuivrQARAGLangGraph:
         chunk_metadata = get_chunk_metadata(rolling_message, docs)
         if metadata:
             chunk_metadata.langchain_metadata = metadata
-            chunk_metadata.langchain_metadata.langfuse_trace_url = (
-                langfuse_handler.get_trace_url()
-            )
+            get_url = getattr(langfuse_handler, "get_trace_url", None)
+            if callable(get_url):
+                chunk_metadata.langchain_metadata.langfuse_trace_url = get_url()
 
         yield ParsedRAGChunkResponse(
             answer="",
