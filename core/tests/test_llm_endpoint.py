@@ -61,7 +61,7 @@ def test_llm_endpoint_minimax_default_base_url():
 
     assert isinstance(llm._llm, ChatOpenAI)
     assert llm._llm.model_name == "MiniMax-M3"
-    assert str(llm._llm.openai_api_base) == "https://api.minimax.io/v1"
+    assert str(llm._llm.client.base_url).rstrip("/") == "https://api.minimax.io/v1"
     assert llm.supports_func_calling()
 
 
@@ -79,4 +79,4 @@ def test_llm_endpoint_minimax_custom_base_url():
 
     assert isinstance(llm._llm, ChatOpenAI)
     assert llm._llm.model_name == "MiniMax-M2.7"
-    assert str(llm._llm.openai_api_base) == "https://api.minimaxi.com/v1"
+    assert str(llm._llm.client.base_url).rstrip("/") == "https://api.minimaxi.com/v1"
