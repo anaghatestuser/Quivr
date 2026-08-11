@@ -19,6 +19,12 @@ from quivr_core.rag.utils import model_supports_function_calling
 
 logger = logging.getLogger("quivr_core")
 
+_MINIMAX_OPENAI_BASE_URL = "https://api.minimax.io/v1"
+_MINIMAX_ANTHROPIC_BASE_URLS = {
+    "https://api.minimax.io/anthropic",
+    "https://api.minimaxi.com/anthropic",
+}
+
 
 class LLMTokenizer:
     _cache: dict[
@@ -291,6 +297,29 @@ class LLMEndpoint:
                     max_tokens=config.max_output_tokens,
                     temperature=config.temperature,
                 )
+            elif config.supplier == DefaultModelSuppliers.MINIMAX:
+                base_url = (config.llm_base_url or _MINIMAX_OPENAI_BASE_URL).rstrip("/")
+                if base_url in _MINIMAX_ANTHROPIC_BASE_URLS:
+                    assert config.llm_api_key, "Can't load model config"
+                    _llm = ChatAnthropic(
+                        model_name=config.model,
+                        api_key=SecretStr(config.llm_api_key),
+                        base_url=base_url,
+                        max_tokens_to_sample=config.max_output_tokens,
+                        temperature=config.temperature,
+                        timeout=None,
+                        stop=None,
+                    )
+                else:
+                    _llm = ChatOpenAI(
+                        model=config.model,
+                        api_key=SecretStr(config.llm_api_key)
+                        if config.llm_api_key
+                        else None,
+                        base_url=base_url,
+                        max_completion_tokens=config.max_output_tokens,
+                        temperature=config.temperature,
+                    )
 
             else:
                 _llm = ChatOpenAI(
