@@ -12,7 +12,7 @@ Quivr, helps you build your second brain, utilizes the power of GenerativeAI to 
 
 ## Key Features 🎯
 
-- **Opiniated RAG**: We created a RAG that is opinionated, fast and efficient so you can focus on your product
+- **Opinionated RAG**: We created a RAG that is opinionated, fast and efficient so you can focus on your product
 - **LLMs**: Quivr works with any LLM, you can use it with OpenAI, Anthropic, Mistral, Gemma, etc.
 - **Any File**: Quivr works with any file, you can use it with PDF, TXT, Markdown, etc and even add your own parsers.
 - **Customize your RAG**: Quivr allows you to customize your RAG, add internet search, add tools, etc.
@@ -69,7 +69,7 @@ Ensure you have the following installed:
           )
 
           answer = brain.ask(
-              "what is gold? asnwer in french"
+              "what is gold? answer in french"
           )
           print("answer:", answer)
   ```
