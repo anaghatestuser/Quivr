@@ -6,7 +6,7 @@ Quick Start 🪄:
 
 ```python
 from quivr_core import Brain
-from quivr_core.quivr_rag_langgraph import QuivrQARAGLangGraph
+from quivr_core.rag.quivr_rag_langgraph import QuivrQARAGLangGraph
 
 
 brain = Brain.from_files(name="My Brain", file_paths=["file1.pdf", "file2.pdf"])
@@ -20,9 +20,9 @@ Pimp your Brain 🔨 :
 ```python
 from quivr_core import Brain
 from quivr_core.llm.llm_endpoint import LLMEndpoint
-from quivr_core.embedder.embedder import DeterministicFakeEmbedding
+from langchain_core.embeddings import DeterministicFakeEmbedding
 from quivr_core.llm.llm_endpoint import LLMEndpointConfig
-from quivr_core.llm.llm_endpoint import FakeListChatModel
+from langchain_core.language_models import FakeListChatModel
 
 brain = Brain.from_files(
         name="test_brain",

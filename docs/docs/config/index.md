@@ -39,7 +39,7 @@ reranker_config:
   top_n: 5
 llm_config:
 
-  max_context_tokens: 2000
+  max_context_tokens: 8000
 
   temperature: 0.7
   streaming: true

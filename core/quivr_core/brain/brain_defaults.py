@@ -34,12 +34,12 @@ def default_embedder() -> Embeddings:
     try:
         from langchain_openai import OpenAIEmbeddings
 
-        logger.debug("Loaded OpenAIEmbeddings as default LLM for brain")
+        logger.debug("Loaded OpenAIEmbeddings as default embedder for brain")
         embedder = OpenAIEmbeddings()
         return embedder
     except ImportError as e:
         raise ImportError(
-            "Please provide a valid Embedder or install quivr-core['base'] package for using the defaultone."
+            "Please provide a valid Embedder or install quivr-core['base'] package for using the default one."
         ) from e
 
 
