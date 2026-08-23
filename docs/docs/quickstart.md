@@ -72,11 +72,11 @@ Note : [Embeddings](https://python.langchain.com/docs/integrations/text_embeddin
 
 ## Launch with Chainlit
 
-If you want to quickly launch an interface with streamlit, you can simply do at the root of the project :
+If you want to quickly launch an interface with chainlit, you can simply do at the root of the project :
 ```bash
-cd examples/chatbot /
-rye sync /
-rye run chainlit run chainlit.py
+cd examples/chatbot
+rye sync
+rye run chainlit run main.py
 ```
 For more detail, go in [examples/chatbot/chainlit.md](https://github.com/QuivrHQ/quivr/tree/main/examples/chatbot)
 

@@ -132,7 +132,7 @@ reranker_config:
 llm_config:
 
   # maximum number of tokens passed to the LLM to generate the answer
-  max_input_tokens: 4000
+  max_context_tokens: 8000
 
   # temperature for the LLM
   temperature: 0.7
@@ -155,7 +155,7 @@ brain.print_info()
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
-from quivr_core.config import RetrievalConfig
+from quivr_core.rag.entities.config import RetrievalConfig
 
 config_file_name = "./basic_rag_workflow.yaml"
 

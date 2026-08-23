@@ -141,7 +141,7 @@ def defaults_to_proc_entries(
             FileExtension.mdx,
         ],
         cls_mod="quivr_core.processor.implementations.megaparse_processor.MegaparseProcessor",
-        errtxt=f"can't import MegaparseProcessor. Please install quivr-core[{ext_str}] to access MegaparseProcessor",
+        errtxt="can't import MegaparseProcessor. Please install quivr-core[megaparse] to access MegaparseProcessor",
         priority=None,
     )
     return base_processors

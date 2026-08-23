@@ -27,7 +27,7 @@ parser_config:
 3. Create a Brain using the above configuration and the list of files you want to ingest
 ```python
 from quivr_core import Brain
-from quivr_core.config import IngestionConfig
+from quivr_core.rag.entities.config import IngestionConfig
 
 config_file_name = "./basic_ingestion_workflow.yaml"
 
