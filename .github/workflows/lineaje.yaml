@@ -21,7 +21,6 @@ jobs:
         with:
           repository: ${{ github.event.inputs.source_repo }}
           ref: ${{ github.event.inputs.branch }}
-          token: ${{ secrets.GITHUB_TOKEN }}
           path: target-repo
 
       - name: Checkout scanner scripts
@@ -41,7 +40,6 @@ jobs:
       - name: Run Lineaje AI policy scan with fix PR
         env:
           LINEAJE_PAT_TOKEN: ${{ secrets.LINEAJE_PAT_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           TARGET_SHA=$(git -C target-repo rev-parse HEAD)
           python .lineaje-scanner/scripts/gha_repo_scan_fix.py \
