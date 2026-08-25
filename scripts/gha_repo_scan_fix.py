@@ -44,6 +44,7 @@ Exit codes::
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
 import atexit
 import base64
@@ -595,6 +596,166 @@ def run_mcp_scan(
     )
 
 # ===========================================================================
+# Guardrail stub insertion (standalone — no sibling-file / repo dependency)
+# ===========================================================================
+#
+# analyze_uploaded_archive already computes "stub_insertions" server-side
+# (adapter.py's _scan_stub_insertions_readonly, same insertion_point_scanner.py
+# logic the MCP server itself uses) and returns it in each batch's JSON
+# response — file, line, proposed_stub (the exact code to insert),
+# import_needed (the gr_check()-family helper for that language, inlined once
+# per file), safe_to_insert, skip_reason, insert_after. Applying it here needs
+# nothing beyond that JSON + stdlib: no gha_stub_insertion.py, no checkout of
+# the aipo_mcp_server pipeline alongside this script. That older path
+# (gha_stub_insertion.py) additionally re-derived stubs locally via
+# pipeline/stub/guardrail_stub_insertion.py — a much heavier, SiteDescriptor/
+# companion-module design requiring this repo's full pipeline package on the
+# runner, which a truly standalone script (this one, meant to be the only
+# Lineaje file a customer's workflow needs) can't assume.
+
+# Per-language marker proving the shared gr_check()-family helper this
+# extension's import_needed text defines is already present in a file — skip
+# re-inserting it (harmless duplicate `def`/`function` in Python/JS, but a
+# real SyntaxError for a duplicate top-level `class`/`func` in Java/Go).
+_GR_CHECK_MARKERS: Dict[str, str] = {
+    ".py": "def gr_check(",
+    ".js": "function gr_check(",
+    ".jsx": "function gr_check(",
+    ".ts": "function gr_check(",
+    ".tsx": "function gr_check(",
+    ".go": "func grCheck(",
+    ".java": "class GrClient {",
+}
+
+
+def _module_prefix_insert_index(lines: List[str]) -> int:
+    """0-indexed position to insert a new top-level block at — after any
+    shebang/encoding comment AND after a leading module docstring, if
+    present. Only the first statement in a Python file is its module
+    docstring; inserting above it silently demotes it to a dead string-
+    literal expression. Falls back to shebang/encoding-only detection for
+    non-Python sources — never raises."""
+    idx = 0
+    for i, ln in enumerate(lines[:5]):
+        if ln.startswith("#!") or ln.strip().startswith("# -*-"):
+            idx = i + 1
+        if ln.startswith("package "):
+            idx = max(idx, i + 1)
+    try:
+        tree = ast.parse("".join(lines))
+        first = tree.body[0] if tree.body else None
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(getattr(first, "value", None), ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            idx = max(idx, first.end_lineno)
+    except SyntaxError:
+        pass
+    return idx
+
+
+def safe_prefix_insert_index(lines: List[str]) -> int:
+    """Like _module_prefix_insert_index(), but also walks past any leading
+    `from __future__ import` line(s) — those must be the first statement(s)
+    in a Python file; inserting anything above one is a real SyntaxError."""
+    insert_at = _module_prefix_insert_index(lines)
+    while insert_at < len(lines) and lines[insert_at].lstrip().startswith("from __future__ import"):
+        insert_at += 1
+    return insert_at
+
+
+def validate_python_source(new_content: str, abs_path: str) -> Optional[str]:
+    """Whole-file compile() check after a stub insertion. Returns None if
+    still valid, else the SyntaxError message. compile(), not ast.parse() —
+    ast.parse() does not enforce future-import placement."""
+    try:
+        compile(new_content, abs_path, "exec")
+        return None
+    except SyntaxError as exc:
+        return str(exc)
+
+
+def apply_stub_insertions_to_clone(
+    stub_insertions: List[Dict[str, Any]],
+    source_dir: str,
+) -> Tuple[Dict[str, str], List[str]]:
+    """Apply the server-computed stub_insertions to files under source_dir.
+
+    Returns ``(validated_fixes, failed_or_skipped)`` — validated_fixes maps
+    repo-relative path -> new file content, ready for _create_fix_pr.
+    """
+    by_file: Dict[str, List[Dict[str, Any]]] = {}
+    skipped: List[str] = []
+    for s in stub_insertions:
+        rel = (s.get("file") or "").strip().replace("\\", "/")
+        if not rel:
+            continue
+        if s.get("status") != "detected":
+            continue  # "already_present" — nothing to do
+        if not s.get("safe_to_insert"):
+            skipped.append(f"{rel}:{s.get('line', '')} {s.get('skip_reason', '') or 'unsafe'}".strip())
+            continue
+        by_file.setdefault(rel, []).append(s)
+
+    validated: Dict[str, str] = {}
+    for rel_path, hits in by_file.items():
+        abs_path = os.path.join(source_dir, rel_path)
+        if not os.path.isfile(abs_path):
+            logger.warning("Stub target not found in checkout: %s — skipping", rel_path)
+            skipped.append(f"{rel_path} not found in checkout")
+            continue
+
+        with open(abs_path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+        ext = pathlib.Path(rel_path).suffix.lower()
+
+        # Insert bottom-up so an earlier insertion never shifts a later hit's
+        # (already-captured) line number out from under it.
+        sorted_hits = sorted(hits, key=lambda h: h.get("line", 0), reverse=True)
+        needs_import = False
+        for hit in sorted_hits:
+            proposed = hit.get("proposed_stub") or ""
+            if not proposed:
+                continue
+            line = int(hit.get("line") or 0)
+            # 1-based line; insert_after=True (result/lhs patterns) must land
+            # AFTER the line assigning the variable the stub references —
+            # inserting before it is a NameError.
+            idx = max(0, line if hit.get("insert_after") else line - 1)
+            idx = min(idx, len(lines))
+            lines.insert(idx, proposed + "\n")
+            needs_import = True
+
+        if needs_import:
+            import_block = next(
+                (h.get("import_needed") for h in hits if h.get("import_needed")), "",
+            )
+            marker = _GR_CHECK_MARKERS.get(ext, "def gr_check(")
+            if import_block and marker not in "".join(lines):
+                lines.insert(safe_prefix_insert_index(lines), import_block.rstrip("\n") + "\n")
+
+        new_content = "".join(lines)
+        if ext == ".py":
+            syntax_err = validate_python_source(new_content, abs_path)
+            if syntax_err:
+                logger.warning(
+                    "Skip %s — stub insertion would produce invalid syntax (%s); left untouched",
+                    rel_path, syntax_err,
+                )
+                skipped.append(f"{rel_path} would be invalid Python after insertion ({syntax_err})")
+                continue
+
+        validated[rel_path] = new_content
+
+    logger.info(
+        "Stub insertions applied: %d file(s) changed, %d skipped",
+        len(validated), len(skipped),
+    )
+    return validated, skipped
+
+
+# ===========================================================================
 # Parallel batch scan
 # ===========================================================================
 
@@ -610,7 +771,7 @@ def parallel_batch_scan(
     bearer_getter: Callable[[], str],
     manifest_files: Optional[List[str]] = None,
     max_workers: int = MAX_SCAN_WORKERS,
-) -> Tuple[List[Dict[str, Any]], List[str], List[Dict[str, str]], int, List[str], str]:
+) -> Tuple[List[Dict[str, Any]], List[str], List[Dict[str, str]], int, List[str], str, List[Dict[str, Any]]]:
     all_violations: List[Dict[str, Any]] = []
     all_reports: List[str] = []
     all_aibom: List[Dict[str, str]] = []
@@ -618,6 +779,7 @@ def parallel_batch_scan(
     failed_batch_count = 0
     failure_details: List[str] = []
     enforce_service_url = ""
+    all_stub_insertions: List[Dict[str, Any]] = []
     lock = threading.Lock()
 
     def _scan_one(batch_idx: int, batch_files: List[str]) -> Tuple[int, Dict[str, Any]]:
@@ -649,11 +811,12 @@ def parallel_batch_scan(
         batch_report = mcp_result.get("report", "")
         batch_aibom = mcp_result.get("aibom", [])
         batch_enforce = (mcp_result.get("enforce_service_url") or "").strip()
+        batch_stub_insertions = mcp_result.get("stub_insertions") or []
         logger.info(
-            "Batch %d/%d done: status=%s violations=%d aibom=%d enforce=%s",
+            "Batch %d/%d done: status=%s violations=%d aibom=%d enforce=%s stub_insertions=%d",
             batch_idx, len(batches), mcp_result.get("status", "unknown"),
             len(batch_violations), len(batch_aibom),
-            batch_enforce or "(none)",
+            batch_enforce or "(none)", len(batch_stub_insertions),
         )
         with lock:
             all_violations.extend(batch_violations)
@@ -666,6 +829,7 @@ def parallel_batch_scan(
                 if key not in aibom_seen:
                     aibom_seen.add(key)
                     all_aibom.append(entry)
+            all_stub_insertions.extend(batch_stub_insertions)
 
     workers = min(len(batches), max_workers)
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -688,7 +852,7 @@ def parallel_batch_scan(
                 logger.debug("Full exception:", exc_info=exc)
                 failure_details.append(detail)
 
-    return all_violations, all_reports, all_aibom, failed_batch_count, failure_details, enforce_service_url
+    return all_violations, all_reports, all_aibom, failed_batch_count, failure_details, enforce_service_url, all_stub_insertions
 
 # ===========================================================================
 # JSON output
@@ -1028,11 +1192,14 @@ def _create_fix_pr(
     pr_body_lines = [
         "## UniFAI Guardrail Stub Insertion",
         "",
-        f"Automated guardrail stubs and enforce-API config for `{branch}` at `{sha_short}`.",
+        f"Automated guardrail stubs for `{branch}` at `{sha_short}`.",
         "",
-        "Each stub posts the crossing payload to `POST {GR_SERVICE_URL}/enforce`.",
-        "Enforce URL and `refreshtoken` are in `.lineaje/guardrail.json`. Runtime",
-        "stubs exchange `refreshtoken` for a Bearer and POST `{GR_SERVICE_URL}/enforce`.",
+        "Each stub posts the crossing payload to `POST {GR_SERVICE_URL}/enforce` "
+        "(a small `gr_check()`/`GrClient` helper, inlined once per file — no extra "
+        "dependency to install). Set these environment variables where this code "
+        "actually runs: `GR_SERVICE_URL` (required), and one of "
+        "`GR_BEARER_TOKEN` / `LINEAJE_PAT_TOKEN` / `LINEAJE_PAT` for auth. Without "
+        "`GR_SERVICE_URL` set, every stub fails open (passes data through unchecked).",
         "",
         f"### Files updated ({len(committed)})",
         "",
@@ -1175,7 +1342,10 @@ def _execute_scan(args: argparse.Namespace) -> int:
 
     # Step 2: MCP scan
     with tempfile.TemporaryDirectory(prefix="gha-repo-scan-") as temp_dir:
-        all_violations, all_reports, all_aibom, failed_batches_count, failure_details, enforce_service_url = parallel_batch_scan(
+        (
+            all_violations, all_reports, all_aibom, failed_batches_count,
+            failure_details, enforce_service_url, all_stub_insertions,
+        ) = parallel_batch_scan(
             batches=batches,
             source_dir=source_path,
             temp_dir=temp_dir,
@@ -1211,35 +1381,41 @@ def _execute_scan(args: argparse.Namespace) -> int:
     if failed_batches_count:
         status = "error"
 
-    # Step 3: Insert guardrail stubs + enforce API info and create PR.
+    # Step 3: Insert guardrail stubs and create PR — using the stub_insertions
+    # analyze_uploaded_archive already computed and returned per batch (see
+    # apply_stub_insertions_to_clone's docstring above). No sibling-file or
+    # aipo_mcp_server-checkout dependency: this script is self-contained.
     # Do NOT apply remediation_actions / fix_code — analyze_uploaded_archive
-    # returns those empty on purpose. The PR carries stubs and enforce config.
+    # returns those empty on purpose. The PR carries stubs only.
     remediation_pr_number: Optional[int] = None
     remediation_branch = ""
     failed_rem_files: List[str] = []
 
     # github_token already resolved near the top of this function (also used for --clone).
     should_create_pr = bool(github_token and getattr(args, "create_fix_pr", False))
-    has_stub_work = bool(all_violations or all_aibom or enforce_service_url)
+    has_stub_work = bool(all_stub_insertions)
     if should_create_pr and has_stub_work:
         logger.info(
-            "STEP 3: Inserting guardrail stubs + enforce API info (%d violation(s), %d AIBOM, enforce=%s)",
-            len(all_violations), len(all_aibom), enforce_service_url or "(none)",
+            "STEP 3: Inserting %d guardrail stub candidate(s) and creating PR",
+            len(all_stub_insertions),
         )
         try:
-            _scripts_dir = os.path.dirname(os.path.abspath(__file__))
-            if _scripts_dir not in sys.path:
-                sys.path.insert(0, _scripts_dir)
-            from gha_stub_insertion import apply_stubs_and_enforce_to_clone
-            _refresh = _scan_refresh_token(args)
-            validated_fixes, failed_rem_files, fix_table = apply_stubs_and_enforce_to_clone(
-                all_violations, source_path, file_list,
-                enforce_service_url=enforce_service_url,
-                aibom=all_aibom,
-                refresh_token=_refresh,
+            validated_fixes, failed_rem_files = apply_stub_insertions_to_clone(
+                all_stub_insertions, source_path,
             )
+            fix_table = [
+                {
+                    "policy": ", ".join(
+                        {pd.get("policy_id", "") for pd in (s.get("policy_details") or []) if pd.get("policy_id")}
+                    ) or "guardrail_stub",
+                    "description": s.get("description", "")[:200],
+                    "file": s.get("file", ""),
+                }
+                for s in all_stub_insertions
+                if s.get("status") == "detected" and (s.get("file") or "") in validated_fixes
+            ]
             logger.info(
-                "Stub/enforce files ready: %d file(s); skipped: %d",
+                "Stub files ready: %d file(s); skipped: %d",
                 len(validated_fixes), len(failed_rem_files),
             )
             if validated_fixes:
@@ -1249,7 +1425,7 @@ def _execute_scan(args: argparse.Namespace) -> int:
                     report=combined_report, failed_files=failed_rem_files,
                 )
             else:
-                logger.warning("No stubs or enforce files written — skipping PR creation")
+                logger.warning("No stubs written — skipping PR creation")
         except Exception as exc:
             logger.error("Stub insertion / PR step failed: %s", exc)
     elif has_stub_work and not getattr(args, "create_fix_pr", False):
@@ -1317,8 +1493,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--lineaje-pat", default="", dest="lineaje_pat",
-        help="Lineaje PAT / refresh token for MCP auth and customer "
-             ".lineaje/guardrail.json refreshtoken (default: $LINEAJE_PAT_TOKEN).",
+        help="Lineaje PAT / refresh token for MCP auth (default: $LINEAJE_PAT_TOKEN). "
+             "Inserted guardrail stubs read their own auth from GR_BEARER_TOKEN / "
+             "LINEAJE_PAT_TOKEN / LINEAJE_PAT at the customer's own runtime — this "
+             "flag only authenticates THIS scan's MCP calls.",
     )
     parser.add_argument(
         "--refresh-token", default="", dest="refresh_token",
