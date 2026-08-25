@@ -31,8 +31,8 @@ Output (stdout, JSON)::
 Required environment variable::
 
     LINEAJE_PAT_TOKEN  — Lineaje refresh token (exchanged for short-lived access tokens
-                          via renew-access-token; override the endpoint with
-                          LINEAJE_RENEW_ACCESS_TOKEN_URL)
+                          at SCIM renew-access-token). Override with
+                          LINEAJE_RENEW_ACCESS_TOKEN_URL or SCIM_SERVICE_URL.
 
 Exit codes::
 
@@ -46,7 +46,6 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
-import atexit
 import base64
 import fnmatch
 import io
@@ -55,8 +54,6 @@ import logging
 import os
 import pathlib
 import re
-import shutil
-import subprocess
 import sys
 import tarfile
 import tempfile
@@ -75,23 +72,37 @@ logger = logging.getLogger("gha_repo_scan")
 # Constants
 # ===========================================================================
 
+MCP_SERVER_URL = "https://mcp.commercialdev.dev.veedna.com/mcp/"
 # MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
-MCP_SERVER_URL = "https://mcp.commercialdev.dev.veedna.com/mcp"
 
 MAX_SCAN_WORKERS = 4
 REMEDIATION_BRANCH_PREFIX = "remediation/unifai-gha"
 DEFAULT_UNIFAI_FILE_BATCH_SIZE = 100
+# GitHub rejects POST /pulls with HTTP 422 when body > 65536 chars.
+GITHUB_PR_BODY_SAFE_LIMIT = 60_000
+_PR_BODY_TRUNCATION_NOTE = (
+    "\n\n---\n\n"
+    "*…Report truncated for GitHub PR body size limit. "
+    "Retrieve the full text from CI logs.*"
+)
 
 _DEFAULT_LINEAJE_TOKEN_REFRESH_SKEW_SEC = 120
 
-# LINEAJE_PAT_TOKEN is a refresh token here — exchanged via renew-access-token
-# for a short-lived MCP bearer. Override the full URL with LINEAJE_RENEW_ACCESS_TOKEN_URL
-# (e.g. for commercialdev) if this prod default doesn't match your environment.
+# UI / GHA ``LINEAJE_PAT_TOKEN`` is a SCIM-issued refresh token. Identity-service
+# ``/lineajeidentity/.../renew-access-token`` cannot decrypt it (HTTP 500
+# "trying to decrypt the string"). Exchange at SCIM instead.
+_SCIM_RENEW_ACCESS_TOKEN_PATH = "/scim/api/v1/auth/native/renew-access-token"
+_IDENTITY_RENEW_ACCESS_TOKEN_PATH = "/lineajeidentity/api/v1/auth/native/renew-access-token"
+_SCIM_SERVICE_URL_DEFAULT = "https://scim-service.commercialdev.dev.veedna.com"
 _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD = (
-    "https://lineaje-identity-service.commercialdev.dev.veedna.com"
-    # "https://lineaje-identity-service.v2.prod.veedna.com"
-    "/lineajeidentity/api/v1/auth/native/renew-access-token"
+    _SCIM_SERVICE_URL_DEFAULT + _SCIM_RENEW_ACCESS_TOKEN_PATH
 )
+
+_LINEAJE_IDENTITY_SERVICE_URL_DEFAULT = (
+    "https://lineaje-identity-service.commercialdev.dev.veedna.com"
+)
+
+_PAT_INTROSPECT_PATH = "/lineajeidentity/api/v1/pat/introspect"
 
 _ARCHIVE_EXCLUDE = {
     ".git", ".gitignore", ".gitattributes", ".gitmodules", ".hg", ".svn",
@@ -166,6 +177,45 @@ def _normalize_url(url: Optional[str]) -> str:
     return u
 
 
+def _scim_renew_url_from_identity_url(url: str) -> str:
+    """Map identity-service renew URLs onto the SCIM equivalent.
+
+    SCIM-issued refresh tokens fail at identity with HTTP 500
+    ``trying to decrypt the string``.
+    """
+    u = (url or "").strip().rstrip("/")
+    if not u or _IDENTITY_RENEW_ACCESS_TOKEN_PATH not in u:
+        return u
+    parsed = urllib.parse.urlparse(u)
+    host = (parsed.netloc or "").replace("lineaje-identity-service", "scim-service")
+    scheme = parsed.scheme or "https"
+    return f"{scheme}://{host}{_SCIM_RENEW_ACCESS_TOKEN_PATH}"
+
+
+def _resolve_renew_access_token_url(explicit: Optional[str] = None) -> str:
+    """SCIM renew-access-token URL for a GHA/UI refresh token.
+
+    Order: explicit arg, LINEAJE_RENEW_ACCESS_TOKEN_URL, {SCIM_SERVICE_URL}/scim/...,
+    commercialdev SCIM default. Identity-service renew URLs are rewritten to SCIM.
+    """
+    scim_base = _normalize_url(os.environ.get("SCIM_SERVICE_URL")).rstrip("/")
+    derived = f"{scim_base}{_SCIM_RENEW_ACCESS_TOKEN_PATH}" if scim_base else ""
+    raw = (
+        _normalize_url(explicit)
+        or _normalize_url(os.environ.get("LINEAJE_RENEW_ACCESS_TOKEN_URL"))
+        or derived
+        or _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD
+    )
+    rewritten = _scim_renew_url_from_identity_url(raw) or raw
+    if rewritten != raw.rstrip("/"):
+        logger.warning(
+            "Auth: renew URL %s is identity-service; using SCIM %s "
+            "(identity cannot decrypt SCIM refresh tokens)",
+            raw, rewritten,
+        )
+    return rewritten.rstrip("/")
+
+
 def _identity_token_response_dict(raw_text: str, *, context: str) -> dict:
     text = raw_text.strip() if raw_text else ""
     try:
@@ -203,11 +253,7 @@ class RefreshTokenTokenManager:
         self._refresh_token = _normalize_token(refresh_token)
         if not self._refresh_token:
             raise ValueError("LINEAJE_PAT_TOKEN must be non-empty")
-        self._renew_url = (
-            _normalize_url(renew_access_token_url)
-            or _normalize_url(os.environ.get("LINEAJE_RENEW_ACCESS_TOKEN_URL"))
-            or _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD
-        ).rstrip("/")
+        self._renew_url = _resolve_renew_access_token_url(renew_access_token_url)
         self._lock = threading.Lock()
         self._access_token = ""
         self._access_deadline = 0.0
@@ -239,6 +285,7 @@ class RefreshTokenTokenManager:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        logger.info("Auth: exchanging refresh token at %s", self._renew_url)
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 data = _identity_token_response_dict(resp.read().decode(), context="renew-access-token")
@@ -273,21 +320,94 @@ def _looks_like_jwt_blob(value: str) -> bool:
 
 
 def _looks_like_already_usable_bearer(value: str) -> bool:
-    """True if *value* is already a Bearer (JWT). Opaque refresh tokens and PATs
-    are exchanged via renew-access-token, not sent as Bearer / introspected.
-    """
+    """True if *value* is already a Bearer (JWT), not an opaque refresh token."""
     s = value.strip()
     if not s:
         return False
     return _looks_like_jwt_blob(s)
 
 
-def _scan_refresh_token(args: Optional[argparse.Namespace] = None) -> str:
-    """PAT / refresh token from ``--lineaje-pat`` / ``--refresh-token`` or GHA env.
+def _tenant_id_from_access_jwt(access_token: str) -> str:
+    """Read tenant_id from the access JWT payload. No PAT introspect.
 
-    Never hardcoded. Customer stubs store this as ``refreshtoken`` and exchange
-    it for a Bearer.
+    Lineaje puts it on ``user_metadata.tenant_id`` (top-level ``tenant_id``
+    is also accepted). Signature is not verified — this token was just
+    minted by renew-access-token over TLS.
     """
+    if not _looks_like_jwt_blob(access_token):
+        return ""
+    try:
+        payload = access_token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+    except Exception:
+        return ""
+    if not isinstance(claims, dict):
+        return ""
+    meta = claims.get("user_metadata") if isinstance(claims.get("user_metadata"), dict) else {}
+    for src in (claims, meta):
+        tid = src.get("tenant_id")
+        if isinstance(tid, str) and tid.strip():
+            return tid.strip()
+    return ""
+
+
+
+def _identity_service_base_url() -> str:
+    """Resolve identity service base URL.
+
+    Resolution order:
+      1. LINEAJE_IDENTITY_SERVICE_URL env var
+      2. Host extracted from LINEAJE_FETCH_ACCESS_TOKEN_URL
+      3. Host extracted from LINEAJE_RENEW_ACCESS_TOKEN_URL
+      4. Hardcoded default (_LINEAJE_IDENTITY_SERVICE_URL_DEFAULT)
+    """
+    explicit = os.environ.get("LINEAJE_IDENTITY_SERVICE_URL", "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    for env_var in ("LINEAJE_FETCH_ACCESS_TOKEN_URL", "LINEAJE_RENEW_ACCESS_TOKEN_URL"):
+        raw = os.environ.get(env_var, "").strip()
+        if raw:
+            parsed = urllib.parse.urlparse(raw)
+            return f"{parsed.scheme}://{parsed.netloc}"
+    return _LINEAJE_IDENTITY_SERVICE_URL_DEFAULT
+
+
+def introspect_lineaje_pat(pat: str) -> Dict[str, Any]:
+    """Validate a Lineaje PAT via the identity service introspect endpoint."""
+    base = _identity_service_base_url()
+    if not base:
+        raise RuntimeError(
+            "Identity service URL not configured. "
+            "Set LINEAJE_IDENTITY_SERVICE_URL or LINEAJE_FETCH_ACCESS_TOKEN_URL."
+        )
+    url = base + _PAT_INTROSPECT_PATH
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {pat}", "Accept": "application/json"},
+        method="GET",
+    )
+    logger.info("PAT introspect: GET %s", url)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode()
+            logger.info("PAT introspect: HTTP %s", getattr(resp, "status", None) or resp.getcode())
+    except urllib.error.HTTPError as exc:
+        err_body = exc.read().decode(errors="replace")
+        raise RuntimeError(f"PAT introspect HTTP {exc.code}: {err_body[:400]}") from exc
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"PAT introspect returned non-JSON: {raw[:200]}") from exc
+    logger.info(
+        "PAT introspect: user_email=%s tenant_id=%s company_id=%s",
+        info.get("user_email", ""), info.get("tenant_id", ""), info.get("company_id", ""),
+    )
+    return info
+
+
+def _scan_refresh_token(args: Optional[argparse.Namespace] = None) -> str:
+    """PAT / refresh token from ``--lineaje-pat`` / ``--refresh-token`` or GHA env."""
     cli = ""
     if args is not None:
         cli = _normalize_token(
@@ -300,16 +420,10 @@ def _scan_refresh_token(args: Optional[argparse.Namespace] = None) -> str:
 
 
 def build_bearer_getter(refresh_token: str = "") -> Callable[[], str]:
-    """Return a callable that yields the MCP bearer, from LINEAJE_PAT_TOKEN.
+    """Return a callable that yields the MCP bearer from a refresh token.
 
-    LINEAJE_PAT_TOKEN holds one of two different things depending on how it was minted:
-    - A native **refresh token** (opaque, standard-Base64 string) — exchanged via
-      renew-access-token to obtain a short-lived access token before use.
-    - An already-short-lived **access token** (JWT, or any base64url-shaped token) —
-      usable directly. Sending one of these to renew-access-token's ``refreshToken``
-      param fails server-side ("Illegal base64 character 5f" etc.), since the identity
-      service tries to base64-decode it with the *standard* alphabet and chokes on
-      base64url's ``-``/``_`` or JWTs' internal ``.`` separators.
+    ``--lineaje-pat`` / ``LINEAJE_PAT_TOKEN`` is a refresh token. It is
+    exchanged via renew-access-token. A JWT is used directly as Bearer.
     """
     pat = _normalize_token(refresh_token or os.environ.get("LINEAJE_PAT_TOKEN", ""))
     if not pat:
@@ -317,80 +431,9 @@ def build_bearer_getter(refresh_token: str = "") -> Callable[[], str]:
     if _looks_like_already_usable_bearer(pat):
         logger.info("LINEAJE_PAT_TOKEN is already a usable access token — using directly as bearer")
         return lambda: pat
+    logger.info("Auth: treating --lineaje-pat / LINEAJE_PAT_TOKEN as refresh token")
     mgr = RefreshTokenTokenManager(pat)
     return mgr.get_access_token
-
-# ===========================================================================
-# HEAD SHA resolution
-# ===========================================================================
-
-def _resolve_head_sha_from_source(source_path: str) -> str:
-    """Best-effort fallback: read HEAD's commit SHA straight from the git repo
-    at *source_path* when neither ``--head-sha`` nor ``$GITHUB_SHA`` was given.
-
-    Mirrors ``repo_scan.py``'s ``resolve_head_sha`` — since ``--source-path``
-    is already a checked-out git repo, there's no need to ask the caller for
-    a value git already knows. Returns "" (not raised) on any failure, so
-    the normal "missing config" error still fires with a clear message.
-    """
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=source_path, capture_output=True, text=True, timeout=10, check=True,
-        )
-        sha = result.stdout.strip()
-        if sha:
-            logger.info(
-                "head_sha not provided — resolved from git HEAD at %s: %s",
-                source_path, sha[:7],
-            )
-        return sha
-    except Exception as exc:
-        logger.debug("Could not resolve HEAD SHA from %s: %s", source_path, exc)
-        return ""
-
-
-# ===========================================================================
-# Self-clone (--clone)
-# ===========================================================================
-
-def clone_repository(
-    repo_slug: str,
-    branch: str,
-    clone_dir: str,
-    scm_token: str,
-    timeout: int = 300,
-    max_retries: int = 2,
-) -> None:
-    """Clone *repo_slug* (``owner/repo``) at *branch* into *clone_dir*.
-
-    Opt-in via ``--clone`` — this script normally assumes ``--source-path`` is
-    already a checkout (its original GHA-runner design: ``actions/checkout``
-    runs first). ``--clone`` lets it fetch the code itself instead, using an
-    ``x-access-token``-authenticated HTTPS URL, same auth pattern already
-    proven in ``veracode_repo_scan.py``'s ``clone_repository``.
-    """
-    auth_url = f"https://x-access-token:{scm_token}@github.com/{repo_slug}.git"
-    logger.info("Cloning %s (branch=%s) ...", repo_slug, branch)
-    cmd = ["git", "clone", "--depth", "1", "--single-branch", "--no-tags", "--branch", branch, auth_url, clone_dir]
-    last_exc: Exception = RuntimeError("Clone did not run")
-    for attempt in range(1, max_retries + 1):
-        if attempt > 1:
-            logger.warning("Retrying clone (attempt %d/%d) ...", attempt, max_retries)
-            shutil.rmtree(clone_dir, ignore_errors=True)
-        try:
-            subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=True)
-            logger.info("Clone successful: %s", clone_dir)
-            return
-        except subprocess.TimeoutExpired as exc:
-            logger.error("Clone timed out after %ds (attempt %d/%d)", timeout, attempt, max_retries)
-            last_exc = exc
-        except subprocess.CalledProcessError as exc:
-            stderr = (exc.stderr or "").replace(scm_token, "***")
-            logger.error("Clone failed for %s: %s", repo_slug, stderr[:300])
-            raise
-    raise last_exc
-
 
 # ===========================================================================
 # File collection
@@ -496,9 +539,10 @@ def _upload_to_s3(presigned_url: str, archive_path: str) -> None:
     size = os.path.getsize(archive_path)
     logger.info("Uploading %d KB to S3 ...", size // 1024)
     with open(archive_path, "rb") as f:
+        content_type = "application/gzip" if archive_path.endswith((".tar.gz", ".tgz")) else "application/zip"
         req = urllib.request.Request(
             presigned_url, data=f.read(), method="PUT",
-            headers={"Content-Type": "application/gzip" if archive_path.endswith((".tar.gz", ".tgz")) else "application/zip"},
+            headers={"Content-Type": content_type},
         )
         with urllib.request.urlopen(req) as resp:
             if resp.status not in (200, 204):
@@ -676,6 +720,38 @@ def validate_python_source(new_content: str, abs_path: str) -> Optional[str]:
         return str(exc)
 
 
+def _stub_insertions_from_mcp_result(mcp_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Merge stub_insertions with patched_files / companion_files from the MCP response."""
+    stubs = [dict(s) for s in (mcp_result.get("stub_insertions") or [])]
+    by_file: Dict[str, str] = {}
+    for extra in list(mcp_result.get("patched_files") or []) + list(mcp_result.get("companion_files") or []):
+        if not isinstance(extra, dict):
+            continue
+        rel = (extra.get("file") or "").strip().replace("\\", "/")
+        if rel and extra.get("content") is not None:
+            by_file[rel] = extra["content"]
+    if not by_file:
+        return stubs
+    applied: set = set()
+    for s in stubs:
+        rel = (s.get("file") or "").strip().replace("\\", "/")
+        if rel in by_file:
+            s["new_content"] = by_file[rel]
+            s["status"] = "detected"
+            s["safe_to_insert"] = True
+            applied.add(rel)
+    for rel, content in by_file.items():
+        if rel not in applied:
+            stubs.append({
+                "file": rel,
+                "status": "detected",
+                "safe_to_insert": True,
+                "new_content": content,
+                "line": 0,
+            })
+    return stubs
+
+
 def apply_stub_insertions_to_clone(
     stub_insertions: List[Dict[str, Any]],
     source_dir: str,
@@ -687,18 +763,23 @@ def apply_stub_insertions_to_clone(
     """
     by_file: Dict[str, List[Dict[str, Any]]] = {}
     skipped: List[str] = []
+    validated: Dict[str, str] = {}
     for s in stub_insertions:
         rel = (s.get("file") or "").strip().replace("\\", "/")
         if not rel:
             continue
         if s.get("status") != "detected":
             continue  # "already_present" — nothing to do
+        if s.get("new_content"):
+            # Server already instrumented the extracted archive — write the
+            # whole file rather than re-applying proposed_stub line-by-line.
+            validated[rel] = s["new_content"]
+            continue
         if not s.get("safe_to_insert"):
             skipped.append(f"{rel}:{s.get('line', '')} {s.get('skip_reason', '') or 'unsafe'}".strip())
             continue
         by_file.setdefault(rel, []).append(s)
 
-    validated: Dict[str, str] = {}
     for rel_path, hits in by_file.items():
         abs_path = os.path.join(source_dir, rel_path)
         if not os.path.isfile(abs_path):
@@ -811,7 +892,7 @@ def parallel_batch_scan(
         batch_report = mcp_result.get("report", "")
         batch_aibom = mcp_result.get("aibom", [])
         batch_enforce = (mcp_result.get("enforce_service_url") or "").strip()
-        batch_stub_insertions = mcp_result.get("stub_insertions") or []
+        batch_stub_insertions = _stub_insertions_from_mcp_result(mcp_result)
         logger.info(
             "Batch %d/%d done: status=%s violations=%d aibom=%d enforce=%s stub_insertions=%d",
             batch_idx, len(batches), mcp_result.get("status", "unknown"),
@@ -900,6 +981,184 @@ def build_json_output(
     }
 
 
+def _violation_file_and_control(v: Dict[str, Any]) -> Tuple[str, str]:
+    file_ = v.get("file") or (v.get("violating_code") or [{}])[0].get("filename") or "(unknown)"
+    control = v.get("policy_name") or v.get("control") or v.get("policy_id") or "(unknown)"
+    return str(file_), str(control)
+
+
+def format_violations_markdown_table(
+    violations: List[Dict[str, Any]],
+    *,
+    max_files: int = 0,
+) -> str:
+    """GitHub-flavored Markdown table: file → numbered policy names."""
+    from collections import defaultdict
+    by_file: Dict[str, List[str]] = defaultdict(list)
+    for v in violations:
+        file_, control = _violation_file_and_control(v)
+        by_file[file_].append(control)
+    if not by_file:
+        return ""
+    files = sorted(by_file.items())
+    extra = 0
+    if max_files and len(files) > max_files:
+        extra = len(files) - max_files
+        files = files[:max_files]
+    lines = [
+        f"**{len(violations)} violation(s) across {len(by_file)} file(s)**",
+        "",
+        "| File | Policy Violations |",
+        "|------|-------------------|",
+    ]
+    for file_, controls in files:
+        numbered = "".join(f"{i}. {c}<br>" for i, c in enumerate(controls, 1))
+        lines.append(f"| `{file_}` | {numbered} |")
+    if extra:
+        lines.append(f"| _…and {extra} more file(s)_ | _see full scan report_ |")
+    return "\n".join(lines)
+
+
+def _extract_markdown_section(report: str, heading_substr: str) -> str:
+    """Return the ``### …`` section whose heading contains *heading_substr*."""
+    if not report or not heading_substr:
+        return ""
+    lines = report.splitlines()
+    start: Optional[int] = None
+    for i, line in enumerate(lines):
+        if line.startswith("### ") and heading_substr in line:
+            start = i
+            break
+    if start is None:
+        return ""
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].startswith("### "):
+            end = j
+            break
+    return "\n".join(lines[start:end]).strip()
+
+
+def _clip_github_report(report: str, max_chars: int = 40_000) -> str:
+    """Trim a markdown chunk to *max_chars*; close dangling fences."""
+    text = (report or "").strip()
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        clipped = text
+        truncated = False
+    else:
+        budget = max(0, max_chars - len(_PR_BODY_TRUNCATION_NOTE))
+        clipped = text[:budget]
+        truncated = True
+    if clipped.count("```") % 2 == 1:
+        clipped += "\n```\n"
+    if truncated:
+        clipped += _PR_BODY_TRUNCATION_NOTE
+    return clipped
+
+
+def _fit_github_pr_body(text: str, max_chars: int = GITHUB_PR_BODY_SAFE_LIMIT) -> str:
+    """Hard-cap a PR body so GitHub's 65536-char POST /pulls does not 422."""
+    text = text or ""
+    if len(text) <= max_chars:
+        return text
+    note = _PR_BODY_TRUNCATION_NOTE
+    fence = "\n```\n"
+    budget = max(0, max_chars - len(note))
+    clipped = text[:budget]
+    if clipped.count("```") % 2 == 1:
+        budget = max(0, max_chars - len(note) - len(fence))
+        clipped = text[:budget] + fence
+    return clipped + note
+
+
+def _build_fix_pr_body(
+    *,
+    branch: str,
+    sha_short: str,
+    committed: List[str],
+    failed_files: Optional[List[str]] = None,
+    report: str = "",
+    violations: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """PR description: visible UnifAI report first, stubs next, full report folded."""
+    violations = violations or []
+    report_says_violations = "violations_found" in (report or "")
+    status_label = "❌ Not Compliant" if (violations or report_says_violations) else "✅ Compliant"
+    lines: List[str] = [
+        "# UnifAI Security Report",
+        "",
+        f"**Status:** {status_label}",
+        f"**Branch:** `{branch}`",
+        f"**Commit:** `{sha_short}`",
+        "",
+    ]
+    vtable = format_violations_markdown_table(violations, max_files=40)
+    if vtable:
+        lines += [vtable, ""]
+    elif not violations and not report_says_violations:
+        lines += ["No violations found.", ""]
+
+    files_list = "\n".join(f"- `{f}`" for f in committed)
+    stub_block = [
+        "---",
+        "",
+        "## UniFAI Guardrail Stub Insertion",
+        "",
+        f"Automated guardrail stubs for `{branch}` at `{sha_short}`.",
+        "",
+        "Each stub posts the crossing payload to `POST {GR_SERVICE_URL}/enforce` "
+        "(a small `gr_check()`/`GrClient` helper, inlined once per file — no extra "
+        "dependency to install). Set these environment variables where this code "
+        "actually runs: `GR_SERVICE_URL` (required), and one of "
+        "`GR_BEARER_TOKEN` / `LINEAJE_PAT_TOKEN` / `LINEAJE_PAT` for auth. Without "
+        "`GR_SERVICE_URL` set, every stub fails open (passes data through unchecked).",
+        "",
+        f"### Files updated ({len(committed)})",
+        "",
+        files_list,
+        "",
+    ]
+    failed = failed_files or []
+    if failed:
+        failed_list = "\n".join(f"- `{f}`" for f in failed)
+        stub_block += [
+            f"<details><summary>Sites skipped ({len(failed)})</summary>",
+            "",
+            failed_list,
+            "",
+            "</details>",
+            "",
+        ]
+    else:
+        stub_block += ["### Sites skipped", "", "_None_", ""]
+
+    prefix_len = len("\n".join(lines + stub_block))
+    remaining = GITHUB_PR_BODY_SAFE_LIMIT - prefix_len - 400
+
+    policy_section = _extract_markdown_section(report, "SECTION 2: Policy Violations")
+    if policy_section and remaining > 500:
+        section_budget = min(8_000, max(500, remaining // 4))
+        lines += ["---", "", _clip_github_report(policy_section, max_chars=section_budget), ""]
+        remaining -= section_budget
+
+    lines += stub_block
+
+    if report and report.strip() and remaining > 500:
+        lines += [
+            "---",
+            "",
+            "<details>",
+            "<summary><strong>Full scan report</strong></summary>",
+            "",
+            _clip_github_report(report, max_chars=remaining),
+            "",
+            "</details>",
+        ]
+    return _fit_github_pr_body("\n".join(lines))
+
+
 def print_human_output(output: Dict[str, Any]) -> None:
     status = output.get("status", "unknown")
     violations = output.get("violations", [])
@@ -907,6 +1166,9 @@ def print_human_output(output: Dict[str, Any]) -> None:
     metadata = output.get("scan_metadata", {})
     scanned_at = metadata.get("scanned_at", "")
     branch = metadata.get("branch", "")
+    repo = metadata.get("repo") or ""
+    rem_pr = output.get("remediation_pr")
+    rem_branch = output.get("remediation_branch") or ""
 
     if status == "compliant":
         status_label = "✅ Compliant"
@@ -922,6 +1184,10 @@ def print_human_output(output: Dict[str, Any]) -> None:
         print(f"**Branch:** `{branch}`")
     if scanned_at:
         print(f"**Scanned at:** {scanned_at}")
+    if rem_pr:
+        print(f"**Remediation PR:** https://github.com/{repo}/pull/{rem_pr}")
+    elif rem_branch:
+        print(f"**Remediation branch:** `{rem_branch}` (PR was not opened automatically)")
 
     if scan_errors:
         print("\n**Errors:**")
@@ -934,22 +1200,8 @@ def print_human_output(output: Dict[str, Any]) -> None:
             print("\nNo violations found.")
         return
 
-    from collections import defaultdict
-    by_file: Dict[str, List[str]] = defaultdict(list)
-    for v in violations:
-        file_ = v.get("file") or (v.get("violating_code") or [{}])[0].get("filename") or "(unknown)"
-        control = v.get("policy_name") or v.get("control") or v.get("policy_id") or "(unknown)"
-        by_file[file_].append(control)
-
-    num_files = len(by_file)
-    print(f"\n**{len(violations)} violation(s) across {num_files} file(s)**\n")
-
-    print("| File | Policy Violations |")
-    print("|------|-------------------|")
-
-    for file_, controls in sorted(by_file.items()):
-        numbered = "".join(f"{i}. {c}<br>" for i, c in enumerate(controls, 1))
-        print(f"| `{file_}` | {numbered} |")
+    print()
+    print(format_violations_markdown_table(violations, max_files=40))
 
 
 # ===========================================================================
@@ -1119,8 +1371,12 @@ def _create_fix_pr(
     *,
     report: str = "",
     failed_files: Optional[List[str]] = None,
-) -> Tuple[Optional[int], str]:
-    """Commit stub + enforce-API files to a branch and open a PR."""
+    violations: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[Optional[int], str, str]:
+    """Commit stub + enforce-API files to a branch and open a PR.
+
+    Returns ``(pr_number_or_None, remediation_branch, error_or_empty)``.
+    """
     try:
         import sys as _sys
         import os as _os
@@ -1128,20 +1384,10 @@ def _create_fix_pr(
         from scm_client import GitHubClient  # type: ignore
     except ImportError:
         logger.error("scm_client.py not found — cannot create remediation PR")
-        return None, ""
+        return None, "", "scm_client.py not found — cannot create remediation PR"
 
     if not validated_fixes:
-        return None, ""
-
-    if not head_sha:
-        # Without a real SHA, both the short->full SHA lookup and the branch-creation POST to
-        # /git/refs are guaranteed to 422 (GitHub logs an empty-SHA commit lookup, then rejects
-        # a ref pointing at "" for needing 40 chars). Fail here with the real cause instead.
-        logger.error(
-            "Cannot create remediation branch: head_sha is empty. "
-            "Pass --head-sha or ensure $GITHUB_SHA is set in the environment."
-        )
-        return None, ""
+        return None, "", ""
 
     safe_branch = re.sub(r"[^a-zA-Z0-9._/-]", "-", branch)
     sha_short = head_sha[:7]
@@ -1163,7 +1409,7 @@ def _create_fix_pr(
         scm.create_branch(repo, remediation_branch, head_sha)
     except Exception as exc:
         logger.error("Failed to create/verify remediation branch: %s", exc)
-        return None, remediation_branch
+        return None, remediation_branch, f"Failed to create remediation branch: {exc}"
 
     committed: List[str] = []
     for filepath, content in validated_fixes.items():
@@ -1183,47 +1429,49 @@ def _create_fix_pr(
 
     if not committed:
         logger.warning("No files committed — skipping PR creation")
-        return None, remediation_branch
+        return None, remediation_branch, "No files committed — skipping PR creation"
 
     title = f"[unifai-bot] chore: insert guardrail stubs for {branch}@{sha_short}"
-
-    files_list = "\n".join(f"- `{f}`" for f in committed)
-    failed_list = ("\n".join(f"- `{f}`" for f in (failed_files or []))) or "_None_"
-    pr_body_lines = [
-        "## UniFAI Guardrail Stub Insertion",
-        "",
-        f"Automated guardrail stubs for `{branch}` at `{sha_short}`.",
-        "",
-        "Each stub posts the crossing payload to `POST {GR_SERVICE_URL}/enforce` "
-        "(a small `gr_check()`/`GrClient` helper, inlined once per file — no extra "
-        "dependency to install). Set these environment variables where this code "
-        "actually runs: `GR_SERVICE_URL` (required), and one of "
-        "`GR_BEARER_TOKEN` / `LINEAJE_PAT_TOKEN` / `LINEAJE_PAT` for auth. Without "
-        "`GR_SERVICE_URL` set, every stub fails open (passes data through unchecked).",
-        "",
-        f"### Files updated ({len(committed)})",
-        "",
-        files_list,
-        "",
-        f"### Sites skipped ({len(failed_files or [])})",
-        "",
-        failed_list,
-    ]
-    if report:
-        MAX_REPORT_CHARS = 56_000  # leave room for rest of PR body; GitHub cap is 65536
-        report_text = report.strip()
-        if len(report_text) > MAX_REPORT_CHARS:
-            report_text = report_text[:MAX_REPORT_CHARS] + "\n\n---\n\n*…Report truncated for GitHub PR body size limit. Retrieve the full text from CI logs.*"
-        pr_body_lines += ["", "---", "", "<details><summary>Full scan report</summary>", "", report_text, "", "</details>"]
-    pr_body = "\n".join(pr_body_lines)
+    pr_body = _build_fix_pr_body(
+        branch=branch,
+        sha_short=sha_short,
+        committed=committed,
+        failed_files=failed_files,
+        report=report,
+        violations=violations,
+    )
+    logger.info(
+        "PR body: %d chars, report=%s, violations=%d",
+        len(pr_body), "yes" if (report or "").strip() else "no", len(violations or []),
+    )
 
     try:
         pr_number = scm.create_pull_request(repo, title, remediation_branch, branch, pr_body)
         logger.info("Created remediation PR #%d", pr_number)
-        return pr_number, remediation_branch
+        return pr_number, remediation_branch, ""
     except Exception as exc:
-        logger.error("Failed to create remediation PR: %s", exc)
-        return None, remediation_branch
+        logger.error("Failed to create remediation PR (%d chars): %s", len(pr_body), exc)
+        fallback = _build_fix_pr_body(
+            branch=branch,
+            sha_short=sha_short,
+            committed=committed,
+            failed_files=failed_files,
+            report="",
+            violations=[],
+        )
+        try:
+            pr_number = scm.create_pull_request(repo, title, remediation_branch, branch, fallback)
+            logger.warning(
+                "Created remediation PR #%d with fallback body after: %s", pr_number, exc,
+            )
+            return pr_number, remediation_branch, ""
+        except Exception as exc2:
+            logger.error("Fallback PR creation also failed: %s", exc2)
+            return (
+                None,
+                remediation_branch,
+                f"Failed to create remediation PR for `{remediation_branch}`: {exc2}",
+            )
 
 
 # ===========================================================================
@@ -1237,20 +1485,9 @@ def _execute_scan(args: argparse.Namespace) -> int:
     source_path = os.path.abspath(args.source_path)
     server_url = args.mcp_server_url or os.environ.get("MCP_SERVER_URL", "") or MCP_SERVER_URL
     source_code_repo = f"https://github.com/{repo}.git" if repo else source_path
-    do_clone = getattr(args, "clone", False)
-    github_token = (
-        getattr(args, "github_token", None)
-        or os.environ.get("GH_TOKEN", "")
-        or os.environ.get("GITHUB_TOKEN", "")
-    )
 
     # Validate config
-    required = [("GITHUB_REPOSITORY / --repo", repo), ("GITHUB_REF_NAME / --branch", branch)]
-    if do_clone:
-        # Cloning needs a token unconditionally — there's nothing to scan without it,
-        # regardless of whether --create-fix-pr is also set.
-        required.append(("GH_TOKEN / GITHUB_TOKEN / --github-token (required with --clone)", github_token))
-    missing = [n for n, v in required if not v]
+    missing = [n for n, v in [("GITHUB_REPOSITORY / --repo", repo), ("GITHUB_REF_NAME / --branch", branch)] if not v]
     if missing:
         output = build_json_output(
             status="error", repo=repo, branch=branch, head_sha=head_sha,
@@ -1260,50 +1497,19 @@ def _execute_scan(args: argparse.Namespace) -> int:
         print_human_output(output)
         return 2
 
-    if do_clone:
-        # --clone: fetch repo/branch ourselves instead of assuming --source-path is
-        # already a checkout — lets this script run outside a real GHA job (e.g. from
-        # a plain VM) without a separate manual clone step.
-        clone_dir = tempfile.mkdtemp(prefix="gha-repo-scan-clone-")
-        try:
-            clone_repository(repo, branch, clone_dir, github_token)
-        except Exception as exc:
-            shutil.rmtree(clone_dir, ignore_errors=True)
-            output = build_json_output(
-                status="error", repo=repo, branch=branch, head_sha=head_sha,
-                source_code_repo=source_code_repo, files_scanned=0, batches=0, failed_batches=0,
-                violations=[], scan_errors=[f"Clone failed: {exc}"],
-            )
-            print_human_output(output)
-            return 1
-        atexit.register(shutil.rmtree, clone_dir, ignore_errors=True)
-        source_path = clone_dir
-        logger.info("Cloned %s@%s into %s — scanning this checkout", repo, branch, clone_dir)
-
-    if not head_sha:
-        # Neither --head-sha nor $GITHUB_SHA (the latter is only set inside a real GHA
-        # job) — fall back to reading it straight off the checkout being scanned
-        # (the fresh clone above, when --clone was used).
-        head_sha = _resolve_head_sha_from_source(source_path)
-
-    if getattr(args, "create_fix_pr", False) and not head_sha:
-        # head_sha is only load-bearing when we're about to create a remediation branch off it —
-        # an empty value there produces a confusing cascade of GitHub API 422s, not a clear error.
-        output = build_json_output(
-            status="error", repo=repo, branch=branch, head_sha=head_sha,
-            source_code_repo=source_code_repo, files_scanned=0, batches=0, failed_batches=0,
-            violations=[],
-            scan_errors=["Missing required config: GITHUB_SHA / --head-sha (required with --create-fix-pr)"],
-        )
-        print_human_output(output)
-        return 2
-
     try:
         bearer_getter = build_bearer_getter(_scan_refresh_token(args))
-        # Eagerly exchange LINEAJE_PAT_TOKEN for an access token now, so a bad/expired
-        # refresh token fails fast here instead of after a full scan.
+        # Eagerly exchange the refresh token so a bad/expired token fails
+        # here instead of after a full scan. Do not PAT-introspect it.
         access_token = bearer_getter()
-        logger.info("Auth OK — renew-access-token exchange succeeded (token len=%d)", len(access_token))
+        jwt_tenant_id = _tenant_id_from_access_jwt(access_token)
+        if jwt_tenant_id:
+            os.environ.setdefault("GR_TENANT_ID", jwt_tenant_id)
+            os.environ.setdefault("LINEAJE_TENANT_ID", jwt_tenant_id)
+            logger.info("Auth OK — tenant_id=%s from access JWT (no PAT introspect)", jwt_tenant_id)
+        else:
+            jwt_tenant_id = os.environ.get("GR_TENANT_ID") or os.environ.get("LINEAJE_TENANT_ID") or ""
+            logger.info("Auth OK — renew-access-token exchange succeeded (token len=%d)", len(access_token))
     except Exception as exc:
         output = build_json_output(
             status="error", repo=repo, branch=branch, head_sha=head_sha,
@@ -1381,56 +1587,88 @@ def _execute_scan(args: argparse.Namespace) -> int:
     if failed_batches_count:
         status = "error"
 
-    # Step 3: Insert guardrail stubs and create PR — using the stub_insertions
-    # analyze_uploaded_archive already computed and returned per batch (see
-    # apply_stub_insertions_to_clone's docstring above). No sibling-file or
-    # aipo_mcp_server-checkout dependency: this script is self-contained.
-    # Do NOT apply remediation_actions / fix_code — analyze_uploaded_archive
-    # returns those empty on purpose. The PR carries stubs only.
+    # Step 3: Insert guardrail stubs and create PR.
+    # Prefer MCP stub_insertions / patched_files. If --create-fix-pr is set
+    # but the server returned nothing applyable, insert locally from
+    # violations so a PR still opens. Do NOT apply remediation_actions.
     remediation_pr_number: Optional[int] = None
     remediation_branch = ""
     failed_rem_files: List[str] = []
 
-    # github_token already resolved near the top of this function (also used for --clone).
+    github_token = (
+        getattr(args, "github_token", None)
+        or os.environ.get("GH_TOKEN", "")
+        or os.environ.get("GITHUB_TOKEN", "")
+    )
     should_create_pr = bool(github_token and getattr(args, "create_fix_pr", False))
-    has_stub_work = bool(all_stub_insertions)
-    if should_create_pr and has_stub_work:
+    validated_fixes: Dict[str, str] = {}
+    fix_table: List[Dict[str, str]] = []
+
+    if all_stub_insertions:
         logger.info(
-            "STEP 3: Inserting %d guardrail stub candidate(s) and creating PR",
+            "STEP 3: Applying %d MCP stub insertion(s)",
             len(all_stub_insertions),
         )
+        validated_fixes, failed_rem_files = apply_stub_insertions_to_clone(
+            all_stub_insertions, source_path,
+        )
+        fix_table = [
+            {
+                "policy": ", ".join(
+                    {pd.get("policy_id", "") for pd in (s.get("policy_details") or []) if pd.get("policy_id")}
+                ) or "guardrail_stub",
+                "description": s.get("description", "")[:200],
+                "file": s.get("file", ""),
+            }
+            for s in all_stub_insertions
+            if s.get("status") == "detected" and (s.get("file") or "") in validated_fixes
+        ]
+
+    if should_create_pr and not validated_fixes and all_violations:
+        logger.info(
+            "MCP returned 0 applyable stubs; inserting locally from %d violation(s) "
+            "so --create-fix-pr can open a PR",
+            len(all_violations),
+        )
         try:
-            validated_fixes, failed_rem_files = apply_stub_insertions_to_clone(
-                all_stub_insertions, source_path,
+            from gha_stub_insertion import apply_stubs_and_enforce_to_clone
+            validated_fixes, failed_rem_files, fix_table = apply_stubs_and_enforce_to_clone(
+                all_violations,
+                source_path,
+                file_list,
+                enforce_service_url=enforce_service_url,
+                aibom=all_aibom,
+                pat=access_token,
+                refresh_token=_scan_refresh_token(args),
+                tenant_id=os.environ.get("GR_TENANT_ID") or os.environ.get("LINEAJE_TENANT_ID") or "",
             )
-            fix_table = [
-                {
-                    "policy": ", ".join(
-                        {pd.get("policy_id", "") for pd in (s.get("policy_details") or []) if pd.get("policy_id")}
-                    ) or "guardrail_stub",
-                    "description": s.get("description", "")[:200],
-                    "file": s.get("file", ""),
-                }
-                for s in all_stub_insertions
-                if s.get("status") == "detected" and (s.get("file") or "") in validated_fixes
-            ]
-            logger.info(
-                "Stub files ready: %d file(s); skipped: %d",
-                len(validated_fixes), len(failed_rem_files),
+        except Exception as exc:
+            logger.error("Local stub insertion failed: %s", exc)
+            failure_details.append(f"Local stub insertion failed: {exc}")
+
+    if should_create_pr and validated_fixes:
+        logger.info("Creating stub PR (%d file(s))", len(validated_fixes))
+        try:
+            remediation_pr_number, remediation_branch, pr_error = _create_fix_pr(
+                github_token, repo, branch, head_sha,
+                validated_fixes, fix_table,
+                report=combined_report, failed_files=failed_rem_files,
+                violations=all_violations,
             )
-            if validated_fixes:
-                remediation_pr_number, remediation_branch = _create_fix_pr(
-                    github_token, repo, branch, head_sha,
-                    validated_fixes, fix_table,
-                    report=combined_report, failed_files=failed_rem_files,
-                )
-            else:
-                logger.warning("No stubs written — skipping PR creation")
+            if pr_error:
+                failure_details.append(pr_error)
         except Exception as exc:
             logger.error("Stub insertion / PR step failed: %s", exc)
-    elif has_stub_work and not getattr(args, "create_fix_pr", False):
+            failure_details.append(f"Stub insertion / PR step failed: {exc}")
+    elif should_create_pr:
+        logger.warning(
+            "Skipping stub PR — --create-fix-pr was set but there were no stub files "
+            "to commit (mcp stub_insertions=%d violations=%d)",
+            len(all_stub_insertions), len(all_violations),
+        )
+    elif all_stub_insertions and not getattr(args, "create_fix_pr", False):
         logger.info("Skipping stub PR — pass --create-fix-pr to insert stubs and open a PR")
-    elif has_stub_work:
+    elif all_stub_insertions:
         logger.info("Skipping stub PR — GITHUB_TOKEN / --github-token not set")
 
     output = build_json_output(
@@ -1459,16 +1697,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--source-path", default=".",
-        help="Path to the checked-out source code (default: current directory). "
-             "Ignored when --clone is set — the fresh clone is scanned instead.",
-    )
-    parser.add_argument(
-        "--clone", action="store_true",
-        help="Clone --repo/--branch into a temp dir using --github-token before scanning, "
-             "instead of assuming --source-path is already a checkout (default: false). "
-             "Lets this script run outside a real GHA job (e.g. a plain VM) without a "
-             "separate manual clone step. Requires --github-token (or $GH_TOKEN / "
-             "$GITHUB_TOKEN) regardless of --create-fix-pr.",
+        help="Path to the checked-out source code (default: current directory)",
     )
     parser.add_argument(
         "--repo", default="",
