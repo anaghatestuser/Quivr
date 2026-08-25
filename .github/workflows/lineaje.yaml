@@ -38,6 +38,7 @@ jobs:
         run: pip install mcp==1.27.1
 
       - name: Run Lineaje AI policy scan with fix PR
+        timeout-minutes: 60
         env:
           LINEAJE_PAT_TOKEN: ${{ secrets.LINEAJE_PAT_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
