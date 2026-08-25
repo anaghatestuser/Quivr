@@ -49,8 +49,4 @@ jobs:
             --branch "${{ github.event.inputs.branch }}" \
             --head-sha "$TARGET_SHA" \
             --create-fix-pr
-            | tee scan_result.txt
 
-      - name: Publish scan result to job summary
-        if: always()
-        run: cat scan_result.txt >> $GITHUB_STEP_SUMMARY
