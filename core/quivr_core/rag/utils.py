@@ -1,3 +1,72 @@
+# Copyright (c) Lineaje, Inc. All rights reserved.
+# Lineaje guardrail helper — inlined once per file (see _import_hint); no
+# separate package to install. gr_check() POSTs to GR_SERVICE_URL + "/enforce"
+# and fails open (returns `data` unchanged) unless a policy deliberately
+# blocks it (GRBlockedError, only on GR_BLOCK_MODE=enforce + an HTTP 403).
+class GRBlockedError(Exception):
+    def __init__(self, policy_id, reason):
+        self.policy_id = policy_id
+        self.reason = reason
+        super().__init__("Guardrail block for policy %r: %s" % (policy_id, reason))
+
+
+def gr_check(data, source_type, destination_type, tenant_id="", timeout=5.0, **context):
+    import json as _lineaje_json
+    import logging as _lineaje_logging
+    import os as _lineaje_os
+    import urllib.error as _lineaje_urlerr
+    import urllib.request as _lineaje_urlreq
+    _logger = _lineaje_logging.getLogger("lineaje.gr_client")
+    url = _lineaje_os.environ.get("GR_SERVICE_URL", "")  # Lineaje: guardrail endpoint
+    if not url:
+        return data  # Lineaje: fail-open — GR_SERVICE_URL not configured
+    tid = tenant_id or _lineaje_os.environ.get("GR_TENANT_ID", "")
+    bearer = _lineaje_os.environ.get("GR_BEARER_TOKEN") or _lineaje_os.environ.get("LINEAJE_PAT_TOKEN") or _lineaje_os.environ.get("LINEAJE_PAT", "")
+    hop_label = source_type + "->" + destination_type
+    params_key = "out_params" if destination_type == "agent" else "in_params"
+    try:
+        headers = {"Content-Type": "application/json"}
+        if bearer:
+            headers["Authorization"] = "Bearer " + bearer
+        body = {
+            "source_type": source_type,
+            "destination_type": destination_type,
+            params_key: {"data": data},
+        }
+        for _k, _v in context.items():
+            if _v:
+                body[_k] = _v
+        if tid:
+            body["tenant_id"] = tid
+        req = _lineaje_urlreq.Request(
+            url.rstrip("/") + "/enforce",
+            data=_lineaje_json.dumps(body).encode(),
+            headers=headers,
+            method="POST",
+        )
+        with _lineaje_urlreq.urlopen(req, timeout=timeout) as resp:
+            result = _lineaje_json.loads(resp.read())
+    except _lineaje_urlerr.HTTPError as exc:
+        if exc.code == 403:
+            try:
+                detail = _lineaje_json.loads(exc.read()).get("detail", {})
+            except Exception:
+                detail = {}
+            blocked_by = detail.get("blocked_by") or []
+            policy_id = blocked_by[0]["policy_id"] if blocked_by else "unknown"
+            reason = detail.get("message", "Request denied by policy enforcement.")
+            _logger.warning("gr_client[%s]: BLOCKED by policy=%s — %s", hop_label, policy_id, reason)
+            if _lineaje_os.environ.get("GR_BLOCK_MODE", "enforce").lower() == "audit":
+                return data
+            raise GRBlockedError(policy_id, reason)
+        _logger.warning("gr_client[%s]: GR service call failed (%s) — failing open", hop_label, exc)
+        return data
+    except Exception as exc:
+        _logger.warning("gr_client[%s]: GR service call failed (%s) — failing open", hop_label, exc)
+        return data
+    if result.get("status") == "escalate":
+        _logger.warning("gr_client[%s]: escalation flagged — passing through for human review", hop_label)
+    return result.get("result", {}).get("data", data)
 import logging
 from typing import Any, Dict, List, Tuple, no_type_check
 
@@ -39,6 +108,16 @@ def format_history_to_openai_mesages(
         messages.append(HumanMessage(content=human))
         messages.append(AIMessage(content=ai))
     messages.append(HumanMessage(content=question))
+    try:
+        messages = gr_check(messages, "agent", "user_interface", site_id='site:sha256:a90b49e2ec5cb5db2b57e9cb466fd5973a8b647e500475f357393f89043aee17')
+    except Exception as _gr_exc:
+        if type(_gr_exc).__name__ == "GRBlockedError":
+            raise
+        messages = messages
+        import logging as _lineaje_logging
+        _lineaje_logging.getLogger("lineaje.gr_client").warning(
+            "Lineaje guardrail unavailable at 'agent->user_interface' — passing data through unchecked"
+        )
     return messages
 
 
@@ -122,7 +201,28 @@ def get_answers_from_tool_calls(tool_calls):
             if isinstance(args, dict):
                 answers.append(args.get("answer", ""))
             else:
+                _lineaje_payload = f"Expected dict for tool_call args, got {type(args)}"
+                try:
+                    _lineaje_payload = gr_check(_lineaje_payload, "agent", "log", site_id='site:sha256:3fa4ef616f866b4c1f53bd12dca7eb25ff21a4f79d484bdd15fb8429e32d7525')
+                except Exception as _gr_exc:
+                    if type(_gr_exc).__name__ == "GRBlockedError":
+                        raise
+                    _lineaje_payload = _lineaje_payload
+                    import logging as _lineaje_logging
+                    _lineaje_logging.getLogger("lineaje.gr_client").warning(
+                        "Lineaje guardrail unavailable at 'agent->log' — passing data through unchecked"
+                    )
                 logger.warning(f"Expected dict for tool_call args, got {type(args)}")
+    try:
+        answers = gr_check(answers, "agent", "user_interface", site_id='site:sha256:aff460a2d8667066117a7a76ec8502ae90f5a640a9f685a6976abefdccf792ed')
+    except Exception as _gr_exc:
+        if type(_gr_exc).__name__ == "GRBlockedError":
+            raise
+        answers = answers
+        import logging as _lineaje_logging
+        _lineaje_logging.getLogger("lineaje.gr_client").warning(
+            "Lineaje guardrail unavailable at 'agent->user_interface' — passing data through unchecked"
+        )
     return answers
 
 
@@ -158,6 +258,16 @@ def parse_response(raw_response: RawRAGResponse, model_name: str) -> ParsedRAGRe
 
     answer_str = "\n".join(answers)
     parsed_response = ParsedRAGResponse(answer=answer_str, metadata=metadata)
+    try:
+        parsed_response = gr_check(parsed_response, "agent", "user_interface", site_id='site:sha256:5ae048f178a7463e79d4cdc60c174839539697bf8eff6520bb4e6896d3fea942')
+    except Exception as _gr_exc:
+        if type(_gr_exc).__name__ == "GRBlockedError":
+            raise
+        parsed_response = parsed_response
+        import logging as _lineaje_logging
+        _lineaje_logging.getLogger("lineaje.gr_client").warning(
+            "Lineaje guardrail unavailable at 'agent->user_interface' — passing data through unchecked"
+        )
     return parsed_response
 
 
@@ -181,6 +291,16 @@ def format_file_list(
     files = files[:max_files]
 
     files_str = "\n".join(files) if list_files_array else "None"
+    try:
+        files_str = gr_check(files_str, "agent", "user_interface", site_id='site:sha256:60030f18bda71e8dd070c8c644c0d9afa587d14d6d3c3ca6b07bffff3a24d1f4')
+    except Exception as _gr_exc:
+        if type(_gr_exc).__name__ == "GRBlockedError":
+            raise
+        files_str = files_str
+        import logging as _lineaje_logging
+        _lineaje_logging.getLogger("lineaje.gr_client").warning(
+            "Lineaje guardrail unavailable at 'agent->user_interface' — passing data through unchecked"
+        )
     return files_str
 
 

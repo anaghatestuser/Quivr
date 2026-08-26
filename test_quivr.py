@@ -90,7 +90,7 @@ def _lineaje_load_gr_client():
     _lineaje_sys.modules["_lineaje_gr_stub_client"] = _mod
     _spec.loader.exec_module(_mod)
     try:
-        _mod = gr_check(_mod, "agent", "user_interface", site_id='site:sha256:a764291988cf1a6ebaf29d973056e9251ac937c5debc8a6505965a74aecfff4b')
+        _mod = gr_check(_mod, "agent", "user_interface", site_id='site:sha256:793cbe6db78b4c0144b468b9708a084a1cf0f3bbec2084782e232c8e9bfae854')
     except Exception as _gr_exc:
         if type(_gr_exc).__name__ == "GRBlockedError":
             raise
@@ -101,65 +101,90 @@ def _lineaje_load_gr_client():
         )
     return _mod
 
-import asyncio
+import os
 import tempfile
 
-from dotenv import load_dotenv
+from langchain_anthropic import ChatAnthropic
+from langchain_community.embeddings import HuggingFaceEmbeddings
+
 from quivr_core import Brain
-from quivr_core.quivr_rag import QuivrQARAG
-from quivr_core.rag.quivr_rag_langgraph import QuivrQARAGLangGraph
+from quivr_core.llm.llm_endpoint import LLMEndpoint
+from quivr_core.llm.llm_endpoint import LLMEndpointConfig
 
 
-async def main():
-    dotenv_path = "/Users/jchevall/Coding/QuivrHQ/quivr/.env"
-    load_dotenv(dotenv_path)
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt") as temp_file:
-        temp_file.write("Gold is a liquid of blue-like colour.")
-        temp_file.flush()
-
-        brain = await Brain.afrom_files(name="test_brain", file_paths=[temp_file.name])
-
-        await brain.save("~/.local/quivr")
-
-        question = "what is gold? answer in french"
-        async for chunk in brain.ask_streaming(question, rag_pipeline=QuivrQARAG):
-            _lineaje_payload = "answer QuivrQARAG:"
-            # LINEAJE: enforce() `_lineaje_payload` at agent->log log_emit — scan flagged AI_APP_SEC_064 (Enforce synthetic content provenance, labeling, and watermarking for AI-generated outputs.). Mask/block; do not remove without review. site_id='site:sha256:2ffe6e17dc36b90837568bdf27d4b4a12fdda986f4b675f7e2b1ee2496b6cbba'
-            _gr_client = _lineaje_load_gr_client()
-            _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:2ffe6e17dc36b90837568bdf27d4b4a12fdda986f4b675f7e2b1ee2496b6cbba', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, candidate_policies=[{'policy_id': 'AI_DAT_SEC_010', 'guardrail_id': 'Mask PII in Logs', 'policy_version': '2026.08.1'}], fail_mode='BLOCK', source_type='agent', destination_type='log')
-            _lineaje_payload = await __import__('asyncio').to_thread(lambda: _gr_client.enforce(_gr_site, _lineaje_payload, content_type='application/json'))
-            try:
-                import asyncio as _gr_asyncio
-                _lineaje_payload = await _gr_asyncio.to_thread(gr_check, _lineaje_payload, "agent", "log", site_id='site:sha256:2ffe6e17dc36b90837568bdf27d4b4a12fdda986f4b675f7e2b1ee2496b6cbba')
-            except Exception as _gr_exc:
-                if type(_gr_exc).__name__ == "GRBlockedError":
-                    raise
-                _lineaje_payload = _lineaje_payload
-                import logging as _lineaje_logging
-                _lineaje_logging.getLogger("lineaje.gr_client").warning(
-                    "Lineaje guardrail unavailable at 'agent->log' — passing data through unchecked"
-                )
-            print(_lineaje_payload, chunk.answer)
-
-        async for chunk in brain.ask_streaming(
-            question, rag_pipeline=QuivrQARAGLangGraph
-        ):
-            _lineaje_payload_58 = "answer QuivrQARAGLangGraph:"
-            try:
-                import asyncio as _gr_asyncio
-                _lineaje_payload_58 = await _gr_asyncio.to_thread(gr_check, _lineaje_payload_58, "agent", "log", site_id='site:sha256:2ffe6e17dc36b90837568bdf27d4b4a12fdda986f4b675f7e2b1ee2496b6cbba')
-            except Exception as _gr_exc:
-                if type(_gr_exc).__name__ == "GRBlockedError":
-                    raise
-                _lineaje_payload_58 = _lineaje_payload_58
-                import logging as _lineaje_logging
-                _lineaje_logging.getLogger("lineaje.gr_client").warning(
-                    "Lineaje guardrail unavailable at 'agent->log' — passing data through unchecked"
-                )
-            print("answer QuivrQARAGLangGraph:", chunk.answer)
+# Make sure Anthropic key is set
+if not os.getenv("ANTHROPIC_API_KEY"):
+    raise RuntimeError("ANTHROPIC_API_KEY is not set")
 
 
-if __name__ == "__main__":
-    # Run the main function in the existing event loop
-    asyncio.run(main())
+# Claude LLM
+claude = ChatAnthropic(
+    model="claude-sonnet-4-6",
+    temperature=0
+)
+
+llm_endpoint = LLMEndpoint(
+    llm=claude,
+    llm_config=LLMEndpointConfig(
+        model="claude-sonnet-4-6",
+        llm_base_url="https://api.anthropic.com",
+    ),
+)
+
+
+# Local embedding model
+embedder = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
+
+
+with tempfile.NamedTemporaryFile(
+    mode="w",
+    suffix=".txt",
+    delete=False
+) as f:
+    f.write(
+        """
+Employee Name: John Smith
+Employee ID: EMP-1001
+Department: Engineering
+Email: john.smith@example.com
+SSN:345-34-3456
+Phone: 408-555-1234
+Address: 123 Main Street, San Jose, California
+"""
+    )
+
+    filename = f.name
+
+
+brain = Brain.from_files(
+    name="employee_brain",
+    file_paths=[filename],
+    llm=llm_endpoint,
+    embedder=embedder,
+)
+
+
+answer = brain.ask(
+    "What is John Smith's SSN number and email?"
+)
+
+_lineaje_payload_94 = "\nAnswer:"
+try:
+    _lineaje_payload_94 = gr_check(_lineaje_payload_94, "agent", "log", site_id='site:sha256:8cd801e92747113f3e4dbf8998c6123378a791e7931e1537250053b413acb2d8')
+except Exception as _gr_exc:
+    if type(_gr_exc).__name__ == "GRBlockedError":
+        raise
+    _lineaje_payload_94 = _lineaje_payload_94
+    import logging as _lineaje_logging
+    _lineaje_logging.getLogger("lineaje.gr_client").warning(
+        "Lineaje guardrail unavailable at 'agent->log' — passing data through unchecked"
+    )
+print("\nAnswer:")
+_lineaje_payload = answer.answer
+# LINEAJE: enforce() `_lineaje_payload` at agent->log log_emit — scan flagged AI_APP_SEC_064 (Enforce synthetic content provenance, labeling, and watermarking for AI-generated outputs.); AI_DAT_SEC_010 (Do not log PII.). Mask/block; do not remove without review. site_id='site:sha256:8cd801e92747113f3e4dbf8998c6123378a791e7931e1537250053b413acb2d8'
+_gr_client = _lineaje_load_gr_client()
+_gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:8cd801e92747113f3e4dbf8998c6123378a791e7931e1537250053b413acb2d8', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, candidate_policies=[{'policy_id': 'AI_DAT_SEC_010', 'guardrail_id': 'Mask PII in Logs', 'policy_version': '2026.08.1'}], fail_mode='BLOCK', source_type='agent', destination_type='log')
+_lineaje_payload = _gr_client.enforce(_gr_site, _lineaje_payload, content_type='application/json')
+print(_lineaje_payload)

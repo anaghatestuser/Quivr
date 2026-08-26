@@ -1,3 +1,106 @@
+# Copyright (c) Lineaje, Inc. All rights reserved.
+# Lineaje guardrail helper — inlined once per file (see _import_hint); no
+# separate package to install. gr_check() POSTs to GR_SERVICE_URL + "/enforce"
+# and fails open (returns `data` unchanged) unless a policy deliberately
+# blocks it (GRBlockedError, only on GR_BLOCK_MODE=enforce + an HTTP 403).
+class GRBlockedError(Exception):
+    def __init__(self, policy_id, reason):
+        self.policy_id = policy_id
+        self.reason = reason
+        super().__init__("Guardrail block for policy %r: %s" % (policy_id, reason))
+
+
+def gr_check(data, source_type, destination_type, tenant_id="", timeout=5.0, **context):
+    import json as _lineaje_json
+    import logging as _lineaje_logging
+    import os as _lineaje_os
+    import urllib.error as _lineaje_urlerr
+    import urllib.request as _lineaje_urlreq
+    _logger = _lineaje_logging.getLogger("lineaje.gr_client")
+    url = _lineaje_os.environ.get("GR_SERVICE_URL", "")  # Lineaje: guardrail endpoint
+    if not url:
+        return data  # Lineaje: fail-open — GR_SERVICE_URL not configured
+    tid = tenant_id or _lineaje_os.environ.get("GR_TENANT_ID", "")
+    bearer = _lineaje_os.environ.get("GR_BEARER_TOKEN") or _lineaje_os.environ.get("LINEAJE_PAT_TOKEN") or _lineaje_os.environ.get("LINEAJE_PAT", "")
+    hop_label = source_type + "->" + destination_type
+    params_key = "out_params" if destination_type == "agent" else "in_params"
+    try:
+        headers = {"Content-Type": "application/json"}
+        if bearer:
+            headers["Authorization"] = "Bearer " + bearer
+        body = {
+            "source_type": source_type,
+            "destination_type": destination_type,
+            params_key: {"data": data},
+        }
+        for _k, _v in context.items():
+            if _v:
+                body[_k] = _v
+        if tid:
+            body["tenant_id"] = tid
+        req = _lineaje_urlreq.Request(
+            url.rstrip("/") + "/enforce",
+            data=_lineaje_json.dumps(body).encode(),
+            headers=headers,
+            method="POST",
+        )
+        with _lineaje_urlreq.urlopen(req, timeout=timeout) as resp:
+            result = _lineaje_json.loads(resp.read())
+    except _lineaje_urlerr.HTTPError as exc:
+        if exc.code == 403:
+            try:
+                detail = _lineaje_json.loads(exc.read()).get("detail", {})
+            except Exception:
+                detail = {}
+            blocked_by = detail.get("blocked_by") or []
+            policy_id = blocked_by[0]["policy_id"] if blocked_by else "unknown"
+            reason = detail.get("message", "Request denied by policy enforcement.")
+            _logger.warning("gr_client[%s]: BLOCKED by policy=%s — %s", hop_label, policy_id, reason)
+            if _lineaje_os.environ.get("GR_BLOCK_MODE", "enforce").lower() == "audit":
+                return data
+            raise GRBlockedError(policy_id, reason)
+        _logger.warning("gr_client[%s]: GR service call failed (%s) — failing open", hop_label, exc)
+        return data
+    except Exception as exc:
+        _logger.warning("gr_client[%s]: GR service call failed (%s) — failing open", hop_label, exc)
+        return data
+    if result.get("status") == "escalate":
+        _logger.warning("gr_client[%s]: escalation flagged — passing through for human review", hop_label)
+    return result.get("result", {}).get("data", data)
+# Copyright (c) Lineaje, Inc. All rights reserved.
+# Lineaje UnifAI guardrail  version=2.0.0-alpha
+def _lineaje_load_gr_client():
+    """Lineaje-added: load gr_stub_client.py without a pip dependency."""
+    import sys as _lineaje_sys, os as _lineaje_os, importlib.util as _lineaje_ilu
+    if "_lineaje_gr_stub_client" in _lineaje_sys.modules:
+        return _lineaje_sys.modules["_lineaje_gr_stub_client"]
+    _here = _lineaje_os.path.dirname(_lineaje_os.path.abspath(__file__))
+    _cur, _path = _here, _lineaje_os.path.join(_here, "gr_stub_client.py")
+    for _ in range(8):
+        _cand = _lineaje_os.path.join(_cur, "gr_stub_client.py")
+        if _lineaje_os.path.isfile(_cand):
+            _path = _cand
+            break
+        _parent = _lineaje_os.path.dirname(_cur)
+        if _parent == _cur:
+            break
+        _cur = _parent
+    _spec = _lineaje_ilu.spec_from_file_location("_lineaje_gr_stub_client", _path)
+    _mod = _lineaje_ilu.module_from_spec(_spec)
+    _lineaje_sys.modules["_lineaje_gr_stub_client"] = _mod
+    _spec.loader.exec_module(_mod)
+    try:
+        _mod = gr_check(_mod, "agent", "user_interface", site_id='site:sha256:c64afbfe8179a087b0fbd8f0d611f9d62b779f9be5eb1933312937d5de17edef')
+    except Exception as _gr_exc:
+        if type(_gr_exc).__name__ == "GRBlockedError":
+            raise
+        _mod = _mod
+        import logging as _lineaje_logging
+        _lineaje_logging.getLogger("lineaje.gr_client").warning(
+            "Lineaje guardrail unavailable at 'agent->user_interface' — passing data through unchecked"
+        )
+    return _mod
+
 import asyncio
 import datetime
 import logging
@@ -250,6 +353,16 @@ class IdempotentCompressor(BaseDocumentCompressor):
         This is a placeholder until a more sophisticated document compression
         algorithm is implemented.
         """
+        try:
+            documents = gr_check(documents, "agent", "user_interface", site_id='site:sha256:58dba1272b49cd57d0b75c28159382429c9783c3c5f11e9400f0832aced37ebd')
+        except Exception as _gr_exc:
+            if type(_gr_exc).__name__ == "GRBlockedError":
+                raise
+            documents = documents
+            import logging as _lineaje_logging
+            _lineaje_logging.getLogger("lineaje.gr_client").warning(
+                "Lineaje guardrail unavailable at 'agent->user_interface' — passing data through unchecked"
+            )
         return documents
 
 
@@ -297,6 +410,16 @@ class QuivrQARAGLangGraph:
         else:
             reranker = IdempotentCompressor()
 
+        try:
+            reranker = gr_check(reranker, "agent", "user_interface", site_id='site:sha256:fde5b8ea8a60267f793eb0e8f128c75267a7dc49fad6a7274412fd87c918ef06')
+        except Exception as _gr_exc:
+            if type(_gr_exc).__name__ == "GRBlockedError":
+                raise
+            reranker = reranker
+            import logging as _lineaje_logging
+            _lineaje_logging.getLogger("lineaje.gr_client").warning(
+                "Lineaje guardrail unavailable at 'agent->user_interface' — passing data through unchecked"
+            )
         return reranker
 
     def get_retriever(self, **kwargs):
@@ -311,6 +434,16 @@ class QuivrQARAGLangGraph:
         else:
             raise ValueError("No vector store provided")
 
+        try:
+            retriever = gr_check(retriever, "agent", "user_interface", site_id='site:sha256:ee79f756df9f238be476ac17c0a10830c57bd2d9911d2b730c9c40b70856c2a6')
+        except Exception as _gr_exc:
+            if type(_gr_exc).__name__ == "GRBlockedError":
+                raise
+            retriever = retriever
+            import logging as _lineaje_logging
+            _lineaje_logging.getLogger("lineaje.gr_client").warning(
+                "Lineaje guardrail unavailable at 'agent->user_interface' — passing data through unchecked"
+            )
         return retriever
 
     def routing(self, state: AgentState) -> List[Send]:
@@ -334,12 +467,32 @@ class QuivrQARAGLangGraph:
             structured_llm = self.llm_endpoint._llm.with_structured_output(
                 SplittedInput, method="json_schema"
             )
+            try:
+                msg = gr_check(msg, "agent", "llm", site_id='site:sha256:0d4a8228f9b53d8c3d8bea4f7b07979d3311ebca3acf97b7ab801f8508502c0b')
+            except Exception as _gr_exc:
+                if type(_gr_exc).__name__ == "GRBlockedError":
+                    raise
+                msg = msg
+                import logging as _lineaje_logging
+                _lineaje_logging.getLogger("lineaje.gr_client").warning(
+                    "Lineaje guardrail unavailable at 'agent->llm' — passing data through unchecked"
+                )
             response = structured_llm.invoke(msg)
 
         except openai.BadRequestError:
             structured_llm = self.llm_endpoint._llm.with_structured_output(
                 SplittedInput
             )
+            try:
+                msg = gr_check(msg, "agent", "llm", site_id='site:sha256:0d4a8228f9b53d8c3d8bea4f7b07979d3311ebca3acf97b7ab801f8508502c0b')
+            except Exception as _gr_exc:
+                if type(_gr_exc).__name__ == "GRBlockedError":
+                    raise
+                msg = msg
+                import logging as _lineaje_logging
+                _lineaje_logging.getLogger("lineaje.gr_client").warning(
+                    "Lineaje guardrail unavailable at 'agent->llm' — passing data through unchecked"
+                )
             response = structured_llm.invoke(msg)
 
         send_list: List[Send] = []
@@ -364,6 +517,16 @@ class QuivrQARAGLangGraph:
                 )
             )
 
+        try:
+            send_list = gr_check(send_list, "agent", "user_interface", site_id='site:sha256:71d0ae9e91d666610108a3ecd5527edc1eed884294ff4dc07c2b5ab6d05ea8bc')
+        except Exception as _gr_exc:
+            if type(_gr_exc).__name__ == "GRBlockedError":
+                raise
+            send_list = send_list
+            import logging as _lineaje_logging
+            _lineaje_logging.getLogger("lineaje.gr_client").warning(
+                "Lineaje guardrail unavailable at 'agent->user_interface' — passing data through unchecked"
+            )
         return send_list
 
     def routing_split(self, state: AgentState):
@@ -525,11 +688,32 @@ class QuivrQARAGLangGraph:
         )
 
         if relevance_score_threshold is None:
+            try:
+                chunks = gr_check(chunks, "agent", "user_interface", site_id='site:sha256:47b73da74fb8498a8cbc754a31025541f24e12a71ccd3511ab213b9d5363e151')
+            except Exception as _gr_exc:
+                if type(_gr_exc).__name__ == "GRBlockedError":
+                    raise
+                chunks = chunks
+                import logging as _lineaje_logging
+                _lineaje_logging.getLogger("lineaje.gr_client").warning(
+                    "Lineaje guardrail unavailable at 'agent->user_interface' — passing data through unchecked"
+                )
             return chunks
 
         filtered_chunks = []
         for chunk in chunks:
             if config.relevance_score_key not in chunk.metadata:
+                _lineaje_payload = f"Relevance score key {config.relevance_score_key} not found in metadata, cannot filter chunks by relevance"
+                try:
+                    _lineaje_payload = gr_check(_lineaje_payload, "agent", "log", site_id='site:sha256:0300eea5637c93444dc88251be43b5e77c5afbfacb58b438e0df0fea07d891c4')
+                except Exception as _gr_exc:
+                    if type(_gr_exc).__name__ == "GRBlockedError":
+                        raise
+                    _lineaje_payload = _lineaje_payload
+                    import logging as _lineaje_logging
+                    _lineaje_logging.getLogger("lineaje.gr_client").warning(
+                        "Lineaje guardrail unavailable at 'agent->log' — passing data through unchecked"
+                    )
                 logger.warning(
                     f"Relevance score key {config.relevance_score_key} not found in metadata, cannot filter chunks by relevance"
                 )
@@ -539,6 +723,16 @@ class QuivrQARAGLangGraph:
             ):
                 filtered_chunks.append(chunk)
 
+        try:
+            filtered_chunks = gr_check(filtered_chunks, "agent", "user_interface", site_id='site:sha256:56f6bc28f9acb5b97e2dd6dd97769ba3b42afc8a1c9e1e7fcde6bc640d47f276')
+        except Exception as _gr_exc:
+            if type(_gr_exc).__name__ == "GRBlockedError":
+                raise
+            filtered_chunks = filtered_chunks
+            import logging as _lineaje_logging
+            _lineaje_logging.getLogger("lineaje.gr_client").warning(
+                "Lineaje guardrail unavailable at 'agent->user_interface' — passing data through unchecked"
+            )
         return filtered_chunks
 
     async def tool_routing(self, state: AgentState):
@@ -583,6 +777,17 @@ class QuivrQARAGLangGraph:
         else:
             send_list.append(Send("generate_rag", payload))
 
+        try:
+            import asyncio as _gr_asyncio
+            send_list = await _gr_asyncio.to_thread(gr_check, send_list, "agent", "user_interface", site_id='site:sha256:36d08a9b6f61f005406ce8e2fccf6df6e10930cbcc6e3a57b62faf4699df7343')
+        except Exception as _gr_exc:
+            if type(_gr_exc).__name__ == "GRBlockedError":
+                raise
+            send_list = send_list
+            import logging as _lineaje_logging
+            _lineaje_logging.getLogger("lineaje.gr_client").warning(
+                "Lineaje guardrail unavailable at 'agent->user_interface' — passing data through unchecked"
+            )
         return send_list
 
     async def run_tool(self, state: AgentState) -> AgentState:
@@ -711,6 +916,18 @@ class QuivrQARAGLangGraph:
             base_retriever = self.get_retriever(**kwargs)
 
             if i > 1:
+                _lineaje_payload = f"Increasing top_n to {top_n} and k to {k} to retrieve more relevant chunks"
+                try:
+                    import asyncio as _gr_asyncio
+                    _lineaje_payload = await _gr_asyncio.to_thread(gr_check, _lineaje_payload, "agent", "log", site_id='site:sha256:b4f3afcade4c9d6ecef363ed1d5f34c369e2e228f00dfe77dc60c3030e309e8d')
+                except Exception as _gr_exc:
+                    if type(_gr_exc).__name__ == "GRBlockedError":
+                        raise
+                    _lineaje_payload = _lineaje_payload
+                    import logging as _lineaje_logging
+                    _lineaje_logging.getLogger("lineaje.gr_client").warning(
+                        "Lineaje guardrail unavailable at 'agent->log' — passing data through unchecked"
+                    )
                 logging.info(
                     f"Increasing top_n to {top_n} and k to {k} to retrieve more relevant chunks"
                 )
@@ -812,6 +1029,18 @@ class QuivrQARAGLangGraph:
             )[:top_n]
         )
 
+        _lineaje_payload = f"Top knowledge IDs: {top_knowledge_ids}"
+        try:
+            import asyncio as _gr_asyncio
+            _lineaje_payload = await _gr_asyncio.to_thread(gr_check, _lineaje_payload, "agent", "log", site_id='site:sha256:68da78994b82bd5ee5f3d86b3f93cbf138199c430182672f66293e2344af5b43')
+        except Exception as _gr_exc:
+            if type(_gr_exc).__name__ == "GRBlockedError":
+                raise
+            _lineaje_payload = _lineaje_payload
+            import logging as _lineaje_logging
+            _lineaje_logging.getLogger("lineaje.gr_client").warning(
+                "Lineaje guardrail unavailable at 'agent->log' — passing data through unchecked"
+            )
         logger.info(f"Top knowledge IDs: {top_knowledge_ids}")
 
         _docs = []
@@ -906,6 +1135,17 @@ class QuivrQARAGLangGraph:
 
             iteration += 1
             if iteration > MAX_ITERATIONS:
+                _lineaje_payload = f"Attained the maximum number of iterations ({MAX_ITERATIONS})"
+                try:
+                    _lineaje_payload = gr_check(_lineaje_payload, "agent", "log", site_id='site:sha256:7d61ffcea9ce191a08dca54a978266822907119a04e548fcf8300d8b34ef1c75')
+                except Exception as _gr_exc:
+                    if type(_gr_exc).__name__ == "GRBlockedError":
+                        raise
+                    _lineaje_payload = _lineaje_payload
+                    import logging as _lineaje_logging
+                    _lineaje_logging.getLogger("lineaje.gr_client").warning(
+                        "Lineaje guardrail unavailable at 'agent->log' — passing data through unchecked"
+                    )
                 logging.warning(
                     f"Attained the maximum number of iterations ({MAX_ITERATIONS})"
                 )
@@ -949,6 +1189,16 @@ class QuivrQARAGLangGraph:
         msg = prompt_template.format_prompt(**inputs)
         llm = self.bind_tools_to_llm(self.generate_zendesk_rag.__name__)
 
+        try:
+            msg = gr_check(msg, "agent", "llm", site_id='site:sha256:27eb55300402f0bc08d9ab42158f1afe7379393f1d76fa161aaefc96220264b2')
+        except Exception as _gr_exc:
+            if type(_gr_exc).__name__ == "GRBlockedError":
+                raise
+            msg = msg
+            import logging as _lineaje_logging
+            _lineaje_logging.getLogger("lineaje.gr_client").warning(
+                "Lineaje guardrail unavailable at 'agent->llm' — passing data through unchecked"
+            )
         response = llm.invoke(msg)
 
         return {**state, "messages": [response]}
@@ -961,6 +1211,16 @@ class QuivrQARAGLangGraph:
         state, inputs = self.reduce_rag_context(state, inputs, prompt)
         msg = prompt.format(**inputs)
         llm = self.bind_tools_to_llm(self.generate_rag.__name__)
+        try:
+            msg = gr_check(msg, "agent", "llm", site_id='site:sha256:6f310daf8d1fc35fa942643f396e0dd6ffdb12987f30437d40733f8b764b3046')
+        except Exception as _gr_exc:
+            if type(_gr_exc).__name__ == "GRBlockedError":
+                raise
+            msg = msg
+            import logging as _lineaje_logging
+            _lineaje_logging.getLogger("lineaje.gr_client").warning(
+                "Lineaje guardrail unavailable at 'agent->llm' — passing data through unchecked"
+            )
         response = llm.invoke(msg)
 
         return {**state, "messages": [response]}
@@ -1014,9 +1274,30 @@ class QuivrQARAGLangGraph:
             ]
         )
         # Run
+        _lineaje_payload = {"chat_history": final_inputs["chat_history"]}
+        try:
+            _lineaje_payload = gr_check(_lineaje_payload, "agent", "llm", site_id='site:sha256:aba415e6d06f0a76401670fcb9060bae7d4debea3d7618a59e4296b2fcf4d495')
+        except Exception as _gr_exc:
+            if type(_gr_exc).__name__ == "GRBlockedError":
+                raise
+            _lineaje_payload = _lineaje_payload
+            import logging as _lineaje_logging
+            _lineaje_logging.getLogger("lineaje.gr_client").warning(
+                "Lineaje guardrail unavailable at 'agent->llm' — passing data through unchecked"
+            )
         chat_llm_prompt = CHAT_LLM_PROMPT.invoke(
             {"chat_history": final_inputs["chat_history"]}
         )
+        try:
+            chat_llm_prompt = gr_check(chat_llm_prompt, "agent", "llm", site_id='site:sha256:2791dfe3c21a8dab118acea2ac667242c7296ca8cce0ab01c8e6d7288d46620b')
+        except Exception as _gr_exc:
+            if type(_gr_exc).__name__ == "GRBlockedError":
+                raise
+            chat_llm_prompt = chat_llm_prompt
+            import logging as _lineaje_logging
+            _lineaje_logging.getLogger("lineaje.gr_client").warning(
+                "Lineaje guardrail unavailable at 'agent->llm' — passing data through unchecked"
+            )
         response = llm.invoke(chat_llm_prompt)
         return {**state, "messages": [response]}
 
@@ -1191,6 +1472,10 @@ class QuivrQARAGLangGraph:
             structured_llm = self.llm_endpoint._llm.with_structured_output(
                 output_class, method="json_schema"
             )
+            # LINEAJE: enforce() `prompt` at agent->llm pre_model — scan flagged AI_APP_SEC_035 (Agents must log all interactions with an LLM); AI_APP_SEC_039 (Sanitize and validate all input to the AI Model.). Mask/block; do not remove without review. site_id='site:sha256:94e66e40112a220834f5532fb9c6167ca6478126d0adbf5379657658b404b6be'
+            _gr_client = _lineaje_load_gr_client()
+            _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:94e66e40112a220834f5532fb9c6167ca6478126d0adbf5379657658b404b6be', phase='pre_model', boundary={'source': 'agent_message', 'sink': 'model'}, candidate_policies=[], fail_mode='ALLOW_WITH_AUDIT', source_type='agent', destination_type='llm')
+            prompt = _gr_client.enforce(_gr_site, prompt, content_type='application/json', variable_name='prompt', source_file=__file__, before_line=1194)
             return structured_llm.invoke(prompt)
         except openai.BadRequestError:
             structured_llm = self.llm_endpoint._llm.with_structured_output(output_class)
