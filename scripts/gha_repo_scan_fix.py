@@ -47,12 +47,14 @@ import argparse
 import ast
 import asyncio
 import base64
+import fnmatch
 import io
 import json
 import logging
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -65,15 +67,217 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-
-from config import _is_manifest_basename as _is_manifest_file  # noqa: E402
-from config import list_files_for_archive  # noqa: E402
-from config import EVIDENCE_TYPE_SCM_SCAN  # noqa: E402
-
 logger = logging.getLogger("gha_repo_scan")
+
+# ===========================================================================
+# Standalone file-collection helpers (inlined from config.py)
+# ===========================================================================
+# This script is deployed on its own into a target repo's
+# .lineaje-scanner/scripts/ by the GitHub Action — the rest of the
+# aipo_mcp_server repo (including config.py) is not present there, so it
+# must not import from config.py or anywhere else in this repo. Everything
+# below is a straight copy of config.py's MANIFEST_FILE_PATTERNS /
+# ARCHIVE_EXCLUDE_* / list_files_for_archive() / EVIDENCE_TYPE_SCM_SCAN —
+# keep both copies in sync if the source changes.
+
+EVIDENCE_TYPE_SCM_SCAN = "scm_scan"
+
+MANIFEST_FILE_PATTERNS: frozenset = frozenset(
+    {
+        # Python
+        "requirements.txt", "requirements-dev.txt", "requirements-test.txt",
+        "Pipfile", "Pipfile.lock", "pyproject.toml", "setup.py", "setup.cfg",
+        "poetry.lock",
+        # Python — conda
+        "environment.yml", "environment.yaml",
+        # JavaScript/Node.js
+        "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock",
+        # Java
+        "pom.xml", "build.gradle", "build.gradle.kts", "gradle.lockfile",
+        # Scala
+        "build.sbt",
+        # Ruby
+        "Gemfile", "Gemfile.lock",
+        # Go
+        "go.mod", "go.sum",
+        # Rust
+        "Cargo.toml", "Cargo.lock",
+        # .NET
+        "packages.config", "packages.lock.json", "*.csproj", "*.fsproj",
+        "*.vbproj", "nuget.config", "Directory.Packages.props",
+        # PHP
+        "composer.json", "composer.lock",
+        # Swift
+        "Package.swift", "Package.resolved",
+        # Dart / Flutter
+        "pubspec.yaml", "pubspec.lock",
+        # Elixir
+        "mix.exs", "mix.lock",
+        # Ruby gemspec
+        "*.gemspec",
+    }
+)
+
+
+def _is_manifest_file(name: str) -> bool:
+    """True if *name* matches ``MANIFEST_FILE_PATTERNS`` (exact or glob)."""
+    if name in MANIFEST_FILE_PATTERNS:
+        return True
+    return any(
+        fnmatch.fnmatch(name, pat)
+        for pat in MANIFEST_FILE_PATTERNS
+        if "*" in pat or "?" in pat
+    )
+
+
+ARCHIVE_EXCLUDE_DIRS: frozenset = frozenset(
+    {
+        ".git", ".gitignore", ".gitattributes", ".gitmodules", ".hg", ".svn",
+        ".env", ".env.local", ".env.development", ".env.production",
+        "__pycache__", ".pytest_cache", "venv", ".venv", ".venv-scan", "env", ".tox",
+        "htmlcov", ".coverage", ".mypy_cache", ".ruff_cache",
+        "node_modules", ".yarn", ".pnp",
+        "dist", "build", ".next", ".nuxt", "out", "coverage", ".cache",
+        "target", ".gradle", ".m2",
+        "Pods", ".expo",
+        ".idea", ".vscode",
+        ".lineaje-aiepo-security",
+        ".lineaje",
+        "migrations", "alembic",
+    }
+)
+
+ARCHIVE_EXCLUDE_GLOBS: frozenset = frozenset(
+    {
+        "*.secret", "*.key", "*.pem", "*.env.*",
+        "*.zip", "*.tar", "*.tar.gz", "*.jar", "*.war", "*.swp", "*.swo",
+        "*.lock", "package-lock.json", "yarn.lock", "Pipfile.lock",
+        "poetry.lock", "Gemfile.lock", "Cargo.lock", "composer.lock",
+        "*.min.js", "*.min.css", "*.map",
+        "*_pb2.py", "*.pb.go", "*.pb.cc", "*.pb.h",
+        "*.snap",
+    }
+)
+
+BINARY_EXTENSIONS: frozenset = frozenset(
+    {
+        ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".webp", ".svg",
+        ".woff", ".woff2", ".ttf", ".eot", ".otf",
+        ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+        ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar",
+        ".exe", ".dll", ".so", ".dylib", ".class", ".jar", ".war",
+        ".pyc", ".pyo", ".o", ".a",
+        ".mp3", ".mp4", ".avi", ".mov", ".wav", ".flac",
+        ".db", ".sqlite", ".sqlite3",
+    }
+)
+
+_ARCHIVE_EXCLUDE_DIR_GLOBS: tuple = (".venv-*", "venv-*")
+
+
+def _git_ls_files_archive_command(repo_path: str) -> List[str]:
+    """``git ls-files`` argv that skips the same paths the upload archive tool skips.
+
+    ``--exclude-standard`` honors ``.gitignore``. ``-x`` drops matching *untracked*
+    files. ``:(exclude,glob)`` pathspecs also drop *tracked* vendor dirs, lockfiles,
+    binaries, and dependency manifests so a GHA checkout does not pack them.
+    """
+    cmd: List[str] = [
+        "git", "-C", repo_path, "ls-files", "-z", "--cached", "--others", "--exclude-standard",
+    ]
+    x_patterns: List[str] = [
+        *sorted(ARCHIVE_EXCLUDE_DIRS),
+        *sorted(ARCHIVE_EXCLUDE_GLOBS),
+        *sorted(MANIFEST_FILE_PATTERNS),
+        *[f"*{ext}" for ext in sorted(BINARY_EXTENSIONS)],
+        *_ARCHIVE_EXCLUDE_DIR_GLOBS,
+    ]
+    for pattern in x_patterns:
+        cmd.extend(["-x", pattern])
+    cmd.extend(["--", "."])
+    for name in sorted(ARCHIVE_EXCLUDE_DIRS):
+        cmd.append(f":(exclude,glob){name}")
+        cmd.append(f":(exclude,glob){name}/**")
+        cmd.append(f":(exclude,glob)**/{name}")
+        cmd.append(f":(exclude,glob)**/{name}/**")
+    for pat in (*sorted(ARCHIVE_EXCLUDE_GLOBS), *sorted(MANIFEST_FILE_PATTERNS)):
+        cmd.append(f":(exclude,glob){pat}")
+        if not pat.startswith("**/"):
+            cmd.append(f":(exclude,glob)**/{pat}")
+    for ext in sorted(BINARY_EXTENSIONS):
+        cmd.append(f":(exclude,glob)*{ext}")
+        cmd.append(f":(exclude,glob)**/*{ext}")
+    for pat in _ARCHIVE_EXCLUDE_DIR_GLOBS:
+        cmd.append(f":(exclude,glob){pat}")
+        cmd.append(f":(exclude,glob){pat}/**")
+        cmd.append(f":(exclude,glob)**/{pat}")
+        cmd.append(f":(exclude,glob)**/{pat}/**")
+    return cmd
+
+
+def _list_git_files_for_archive(repo_path: str) -> Optional[List[str]]:
+    """Repo-relative files from ``_git_ls_files_archive_command``.
+
+    Returns ``None`` if *repo_path* is not a git work tree or git cannot run.
+    """
+    try:
+        proc = subprocess.run(
+            _git_ls_files_archive_command(repo_path),
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    files: List[str] = []
+    for chunk in proc.stdout.split(b"\0"):
+        if not chunk:
+            continue
+        rel = chunk.decode("utf-8", errors="surrogateescape").replace("\\", "/")
+        while rel.startswith("./"):
+            rel = rel[2:]
+        if not rel:
+            continue
+        full = os.path.join(repo_path, rel)
+        if os.path.isfile(full):
+            files.append(rel)
+    return files
+
+
+def _walk_files_for_archive(root: str) -> List[str]:
+    """``os.walk`` fallback using the same exclude sets as archive upload."""
+    file_list: List[str] = []
+    for dirpath, dirs, filenames in os.walk(root):
+        dirs[:] = [
+            d
+            for d in dirs
+            if d not in ARCHIVE_EXCLUDE_DIRS
+            and not any(fnmatch.fnmatch(d, g) for g in _ARCHIVE_EXCLUDE_DIR_GLOBS)
+        ]
+        for fname in filenames:
+            full_path = os.path.join(dirpath, fname)
+            rel_path = os.path.relpath(full_path, root).replace("\\", "/")
+            ext = pathlib.Path(fname).suffix.lower()
+            if ext in BINARY_EXTENSIONS:
+                continue
+            if _is_manifest_file(fname):
+                continue
+            if any(fnmatch.fnmatch(rel_path, g) for g in ARCHIVE_EXCLUDE_GLOBS):
+                continue
+            if any(part in ARCHIVE_EXCLUDE_DIRS for part in pathlib.Path(rel_path).parts):
+                continue
+            file_list.append(rel_path)
+    return file_list
+
+
+def list_files_for_archive(repo_path: str) -> List[str]:
+    """Prefer ``git ls-files`` with upload-tool excludes; walk if git is unavailable."""
+    listed = _list_git_files_for_archive(repo_path)
+    if listed is not None:
+        return listed
+    return _walk_files_for_archive(repo_path)
 
 
 def _combine_scan_reports(reports: List[str]) -> str:
