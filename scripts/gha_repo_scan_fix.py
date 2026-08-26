@@ -990,6 +990,158 @@ def apply_stub_insertions_to_clone(
     return validated, skipped
 
 
+# Extensions insertion_point_scanner.scan_file() actually scans. Passing the
+# full GHA file_list (lockfiles, markdown, images) is a no-op per file but
+# wastes runner time; restrict to these.
+_LOCAL_STUB_SCANNABLE_EXTS = frozenset({".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go"})
+_LOCAL_STUB_MAX_FILES = 200
+
+
+def _ensure_insertion_point_scanner_on_path() -> None:
+    """Make ``import insertion_point_scanner`` work on a GitHub Actions runner.
+
+    Two layouts exist:
+      1. Action deploy: this script AND insertion_point_scanner.py sit together
+         in ``.lineaje-scanner/scripts/`` (``python path/to/gha_repo_scan.py``
+         already puts that dir on sys.path[0] — still add it explicitly).
+      2. This repo: ``scripts/gha_repo_scan.py`` with the scanner at repo root.
+         Running ``python scripts/gha_repo_scan.py`` puts ``scripts/`` on
+         sys.path, NOT the parent, so the import fails without this.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    parent = os.path.dirname(here)
+    for path in (here, parent):
+        if path and path not in sys.path:
+            sys.path.insert(0, path)
+
+
+def _rel_candidate_file(file_path: str, source_dir: str) -> str:
+    path = (file_path or "").strip().replace("\\", "/")
+    if not path:
+        return ""
+    src = os.path.realpath(source_dir)
+    abs_path = path if os.path.isabs(path) else os.path.normpath(os.path.join(src, path))
+    try:
+        rel = os.path.relpath(os.path.realpath(abs_path), src)
+    except ValueError:
+        return os.path.basename(path).replace("\\", "/")
+    if rel.startswith(".."):
+        return os.path.basename(path).replace("\\", "/")
+    return rel.replace("\\", "/")
+
+
+def _scannable_files_for_local_stubs(
+    violations: List[Dict[str, Any]],
+    file_list: List[str],
+    source_dir: str,
+) -> List[str]:
+    """Prefer files named in violations; otherwise every scannable path in file_list."""
+    listed = {(f or "").replace("\\", "/") for f in file_list}
+    from_violations: List[str] = []
+    seen: set = set()
+    for v in violations or []:
+        rel = _rel_candidate_file(v.get("file") or "", source_dir)
+        if (
+            rel
+            and rel in listed
+            and pathlib.Path(rel).suffix.lower() in _LOCAL_STUB_SCANNABLE_EXTS
+            and rel not in seen
+        ):
+            seen.add(rel)
+            from_violations.append(rel)
+    if from_violations:
+        return from_violations
+    return [
+        f.replace("\\", "/")
+        for f in file_list
+        if pathlib.Path(f).suffix.lower() in _LOCAL_STUB_SCANNABLE_EXTS
+    ]
+
+
+def local_stub_insertions_from_checkout(
+    source_dir: str,
+    file_list: List[str],
+    violations: List[Dict[str, Any]],
+    *,
+    lineaje_pat: str = "",
+) -> Tuple[Dict[str, str], List[str], List[Dict[str, str]]]:
+    """Scan the GHA checkout with insertion_point_scanner and apply stubs.
+
+    Replaces the old ``gha_stub_insertion`` import, which required this
+    repo's full ``pipeline/stub`` package — never present on a customer
+    runner. Returns the same ``(validated_fixes, failed, fix_table)`` shape
+    ``_execute_scan`` uses for the MCP-provided stub_insertions path.
+    """
+    _ensure_insertion_point_scanner_on_path()
+    from insertion_point_scanner import scan_project as _scan_project_local
+    from insertion_point_scanner import _import_hint as _local_import_hint
+
+    targets = _scannable_files_for_local_stubs(violations, file_list, source_dir)
+    if not targets:
+        logger.info("Local insertion-point scan: no scannable files in checkout")
+        return {}, [], []
+    if len(targets) > _LOCAL_STUB_MAX_FILES:
+        logger.warning(
+            "Local insertion-point scan: capping %d scannable file(s) to %d",
+            len(targets), _LOCAL_STUB_MAX_FILES,
+        )
+        targets = targets[:_LOCAL_STUB_MAX_FILES]
+
+    candidates, _mw = _scan_project_local(
+        project_root=source_dir,
+        files_to_scan=targets,
+        lineaje_pat=lineaje_pat or "",
+        max_files=max(len(targets), 1),
+    )
+    stub_insertions: List[Dict[str, Any]] = []
+    for c in candidates:
+        rel = _rel_candidate_file(c.file, source_dir)
+        stub_insertions.append({
+            "file": rel,
+            "line": c.line,
+            "status": "detected",
+            "proposed_stub": c.proposed_stub,
+            "insert_after": c.insert_after,
+            "safe_to_insert": c.safe_to_insert,
+            "skip_reason": c.skip_reason,
+            "description": c.description,
+            "import_needed": _local_import_hint(os.path.splitext(rel)[1]),
+        })
+    validated, failed = apply_stub_insertions_to_clone(stub_insertions, source_dir)
+    fix_table = [
+        {
+            "policy": "guardrail_stub",
+            "description": (s.get("description") or "")[:200],
+            "file": s.get("file", ""),
+        }
+        for s in stub_insertions
+        if s.get("status") == "detected" and (s.get("file") or "") in validated
+    ]
+    logger.info(
+        "Local insertion-point scan: %d candidate(s) found, %d file(s) applied",
+        len(candidates), len(validated),
+    )
+    return validated, failed, fix_table
+
+
+def try_local_stub_insertions_from_checkout(
+    source_dir: str,
+    file_list: List[str],
+    violations: List[Dict[str, Any]],
+    *,
+    lineaje_pat: str = "",
+) -> Tuple[Dict[str, str], List[str], List[Dict[str, str]], Optional[str]]:
+    """Fail-open wrapper: a missing scanner must not abort the GHA scan."""
+    try:
+        validated, failed, table = local_stub_insertions_from_checkout(
+            source_dir, file_list, violations, lineaje_pat=lineaje_pat,
+        )
+        return validated, failed, table, None
+    except Exception as exc:
+        logger.exception("Local stub insertion failed")
+        return {}, [], [], f"Local stub insertion failed: {exc}"
+
+
 # ===========================================================================
 # Parallel batch scan
 # ===========================================================================
@@ -1781,26 +1933,30 @@ def _execute_scan(args: argparse.Namespace) -> int:
         ]
 
     if should_create_pr and not validated_fixes and all_violations:
+        # Legacy fallback here used to import `gha_stub_insertion`, which
+        # required this repo's full pipeline/stub/guardrail_stub_insertion.py
+        # package on the runner — never true for a truly standalone script
+        # (only this file + insertion_point_scanner.py are deployed into a
+        # customer's .lineaje-scanner/scripts/), so it always threw
+        # ModuleNotFoundError here and silently skipped the fix PR. Replaced
+        # with a local scan via insertion_point_scanner.scan_project() — the
+        # same deterministic candidate detector analyze_uploaded_archive uses
+        # server-side — feeding its output through apply_stub_insertions_to_clone()
+        # above (same function, same validated-Python-syntax guarantee) so this
+        # path and the MCP-provided one behave identically.
         logger.info(
-            "MCP returned 0 applyable stubs; inserting locally from %d violation(s) "
-            "so --create-fix-pr can open a PR",
+            "MCP returned 0 applyable stubs; scanning locally for insertion points "
+            "so --create-fix-pr can open a PR (%d violation(s) found)",
             len(all_violations),
         )
-        try:
-            from gha_stub_insertion import apply_stubs_and_enforce_to_clone
-            validated_fixes, failed_rem_files, fix_table = apply_stubs_and_enforce_to_clone(
-                all_violations,
-                source_path,
-                file_list,
-                enforce_service_url=enforce_service_url,
-                aibom=all_aibom,
-                pat=access_token,
-                refresh_token=_scan_refresh_token(args),
-                tenant_id=os.environ.get("GR_TENANT_ID") or os.environ.get("LINEAJE_TENANT_ID") or "",
+        validated_fixes, failed_rem_files, fix_table, local_err = (
+            try_local_stub_insertions_from_checkout(
+                source_path, file_list, all_violations,
+                lineaje_pat=_scan_refresh_token(args),
             )
-        except Exception as exc:
-            logger.error("Local stub insertion failed: %s", exc)
-            failure_details.append(f"Local stub insertion failed: {exc}")
+        )
+        if local_err:
+            failure_details.append(local_err)
 
     if should_create_pr and validated_fixes:
         logger.info("Creating stub PR (%d file(s))", len(validated_fixes))
