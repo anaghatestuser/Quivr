@@ -47,7 +47,6 @@ import argparse
 import ast
 import asyncio
 import base64
-import fnmatch
 import io
 import json
 import logging
@@ -66,7 +65,31 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from config import _is_manifest_basename as _is_manifest_file  # noqa: E402
+from config import list_files_for_archive  # noqa: E402
+from config import EVIDENCE_TYPE_SCM_SCAN  # noqa: E402
+
 logger = logging.getLogger("gha_repo_scan")
+
+
+def _combine_scan_reports(reports: List[str]) -> str:
+    """Union per-batch markdown tables into one report (fallback: concatenate)."""
+    nonempty = [r for r in reports if r]
+    if not nonempty:
+        return ""
+    try:
+        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _root not in sys.path:
+            sys.path.insert(0, _root)
+        from pipeline.report.consolidate import consolidate_batch_reports
+        return consolidate_batch_reports(nonempty)
+    except ImportError:
+        return "\n\n---\n\n".join(nonempty)
+
 
 # ===========================================================================
 # Constants
@@ -103,57 +126,6 @@ _LINEAJE_IDENTITY_SERVICE_URL_DEFAULT = (
 )
 
 _PAT_INTROSPECT_PATH = "/lineajeidentity/api/v1/pat/introspect"
-
-_ARCHIVE_EXCLUDE = {
-    ".git", ".gitignore", ".gitattributes", ".gitmodules", ".hg", ".svn",
-    ".env", ".env.local", ".env.development", ".env.production",
-    "__pycache__", ".pytest_cache", "venv", ".venv", ".venv-scan", "env", ".tox",
-    "htmlcov", ".coverage", ".mypy_cache", ".ruff_cache",
-    "node_modules", ".yarn", ".pnp",
-    "dist", "build", ".next", ".nuxt", "out", "coverage", ".cache",
-    "target", ".gradle", ".m2",
-    "Pods", ".expo",
-    ".idea", ".vscode",
-    ".lineaje-aiepo-security",
-    "migrations", "alembic",
-}
-_ARCHIVE_EXCLUDE_GLOBS = {
-    "*.secret", "*.key", "*.pem", "*.env.*",
-    "*.zip", "*.tar", "*.tar.gz", "*.jar", "*.war", "*.swp", "*.swo",
-    "*.lock", "package-lock.json", "yarn.lock", "Pipfile.lock",
-    "poetry.lock", "Gemfile.lock", "Cargo.lock", "composer.lock",
-    "*.min.js", "*.min.css", "*.map",
-    "*_pb2.py", "*.pb.go", "*.pb.cc", "*.pb.h",
-    "*.snap",
-}
-_BINARY_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".webp", ".svg",
-    ".woff", ".woff2", ".ttf", ".eot", ".otf",
-    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-    ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar",
-    ".exe", ".dll", ".so", ".dylib", ".class", ".jar", ".war",
-    ".pyc", ".pyo", ".o", ".a",
-    ".mp3", ".mp4", ".avi", ".mov", ".wav", ".flac",
-    ".db", ".sqlite", ".sqlite3",
-}
-
-_MANIFEST_FILE_NAMES: frozenset = frozenset({
-    "requirements.txt", "requirements-dev.txt", "requirements-test.txt",
-    "Pipfile", "Pipfile.lock", "pyproject.toml", "setup.py", "setup.cfg", "poetry.lock",
-    "environment.yml", "environment.yaml",
-    "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock",
-    "pom.xml", "build.gradle", "build.gradle.kts", "gradle.lockfile",
-    "build.sbt",
-    "Gemfile", "Gemfile.lock",
-    "go.mod", "go.sum",
-    "Cargo.toml", "Cargo.lock",
-    "packages.config", "packages.lock.json", "nuget.config", "Directory.Packages.props",
-    "composer.json", "composer.lock",
-    "Package.swift", "Package.resolved",
-    "pubspec.yaml", "pubspec.lock",
-    "mix.exs", "mix.lock",
-})
-_MANIFEST_GLOB_PATTERNS: tuple = ("*.csproj", "*.fsproj", "*.vbproj", "*.gemspec")
 
 # ===========================================================================
 # Token helpers
@@ -439,33 +411,9 @@ def build_bearer_getter(refresh_token: str = "") -> Callable[[], str]:
 # File collection
 # ===========================================================================
 
-def _is_manifest_file(filename: str) -> bool:
-    if filename in _MANIFEST_FILE_NAMES:
-        return True
-    return any(fnmatch.fnmatch(filename, pat) for pat in _MANIFEST_GLOB_PATTERNS)
-
-
 def collect_repo_files(local_path: str) -> List[str]:
-    file_list: List[str] = []
-    for root, dirs, filenames in os.walk(local_path):
-        dirs[:] = [
-            d for d in dirs
-            if d not in _ARCHIVE_EXCLUDE
-            and not fnmatch.fnmatch(d, ".venv-*")
-            and not fnmatch.fnmatch(d, "venv-*")
-        ]
-        for fname in filenames:
-            full_path = os.path.join(root, fname)
-            rel_path = os.path.relpath(full_path, local_path)
-            ext = pathlib.Path(fname).suffix.lower()
-            if ext in _BINARY_EXTENSIONS:
-                continue
-            if any(fnmatch.fnmatch(rel_path, g) for g in _ARCHIVE_EXCLUDE_GLOBS):
-                continue
-            if any(p in _ARCHIVE_EXCLUDE for p in pathlib.Path(rel_path).parts):
-                continue
-            file_list.append(rel_path.replace("\\", "/"))
-    return file_list
+    """List scannable files via ``git ls-files``; excludes live in the upload tool."""
+    return list_files_for_archive(local_path)
 
 # ===========================================================================
 # Archive creation
@@ -503,6 +451,7 @@ def create_batch_archive(
             "branch": branch,
             "head_sha": head_sha,
             "scan_type": "full_repository",
+            "evidence_type": EVIDENCE_TYPE_SCM_SCAN,
             "batch_index": batch_index,
             "batch_file_count": len(file_subset),
             "manifest_file_count": len(extra_manifests),
@@ -617,6 +566,7 @@ def _run_mcp_scan_via_client(
                 # public address. Every other caller of this tool leaves this "" (the
                 # server-side default) and gets the server's own resolution instead.
                 analyze_args["mcp_server_location"] = server_url
+                analyze_args["scan_type"] = EVIDENCE_TYPE_SCM_SCAN
                 result = _parse_tool_result(
                     await session2.call_tool("analyze_uploaded_archive", arguments=analyze_args)
                 )
@@ -981,10 +931,42 @@ def build_json_output(
     }
 
 
-def _violation_file_and_control(v: Dict[str, Any]) -> Tuple[str, str]:
-    file_ = v.get("file") or (v.get("violating_code") or [{}])[0].get("filename") or "(unknown)"
+def _violation_line_display(v: Dict[str, Any]) -> str:
+    """1-indexed source line(s) for a finding, or em-dash when unknown."""
+    nums: List[int] = []
+    seen: set = set()
+
+    def _add(raw: Any) -> None:
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return
+        if n > 0 and n not in seen:
+            seen.add(n)
+            nums.append(n)
+
+    vcs = v.get("violating_code")
+    if isinstance(vcs, list):
+        for vc in vcs:
+            if isinstance(vc, dict):
+                _add(vc.get("line"))
+            else:
+                _add(getattr(vc, "line", 0))
+    meta = v.get("metadata") if isinstance(v.get("metadata"), dict) else {}
+    _add(v.get("line"))
+    _add(v.get("line_number"))
+    _add(meta.get("line_number"))
+    if not nums:
+        return "—"
+    return ", ".join(str(n) for n in nums)
+
+
+def _violation_file_line_and_control(v: Dict[str, Any]) -> Tuple[str, str, str]:
+    vcs = v.get("violating_code") or []
+    first_vc = vcs[0] if vcs and isinstance(vcs[0], dict) else {}
+    file_ = v.get("file") or first_vc.get("filename") or "(unknown)"
     control = v.get("policy_name") or v.get("control") or v.get("policy_id") or "(unknown)"
-    return str(file_), str(control)
+    return str(file_), _violation_line_display(v), str(control)
 
 
 def format_violations_markdown_table(
@@ -992,30 +974,39 @@ def format_violations_markdown_table(
     *,
     max_files: int = 0,
 ) -> str:
-    """GitHub-flavored Markdown table: file → numbered policy names."""
-    from collections import defaultdict
-    by_file: Dict[str, List[str]] = defaultdict(list)
+    """GitHub-flavored Markdown table: File | Line | Policy (one row per finding)."""
+    rows: List[Tuple[str, str, str]] = []
+    files: set = set()
     for v in violations:
-        file_, control = _violation_file_and_control(v)
-        by_file[file_].append(control)
-    if not by_file:
+        file_, line, control = _violation_file_line_and_control(v)
+        files.add(file_)
+        rows.append((file_, line, control))
+    if not rows:
         return ""
-    files = sorted(by_file.items())
+
+    def _line_sort_key(line: str) -> int:
+        if not line or line == "—":
+            return 0
+        try:
+            return int(str(line).split(",", 1)[0].strip())
+        except ValueError:
+            return 0
+
+    rows.sort(key=lambda r: (r[0], _line_sort_key(r[1]), r[2]))
     extra = 0
-    if max_files and len(files) > max_files:
-        extra = len(files) - max_files
-        files = files[:max_files]
+    if max_files and len(rows) > max_files:
+        extra = len(rows) - max_files
+        rows = rows[:max_files]
     lines = [
-        f"**{len(violations)} violation(s) across {len(by_file)} file(s)**",
+        f"**{len(violations)} violation(s) across {len(files)} file(s)**",
         "",
-        "| File | Policy Violations |",
-        "|------|-------------------|",
+        "| File | Line | Policy |",
+        "|------|------|--------|",
     ]
-    for file_, controls in files:
-        numbered = "".join(f"{i}. {c}<br>" for i, c in enumerate(controls, 1))
-        lines.append(f"| `{file_}` | {numbered} |")
+    for file_, line, control in rows:
+        lines.append(f"| `{file_}` | {line} | {control} |")
     if extra:
-        lines.append(f"| _…and {extra} more file(s)_ | _see full scan report_ |")
+        lines.append(f"| _…and {extra} more violation(s)_ | — | _see full scan report_ |")
     return "\n".join(lines)
 
 
@@ -1077,13 +1068,14 @@ def _build_fix_pr_body(
     *,
     branch: str,
     sha_short: str,
-    committed: List[str],
-    failed_files: Optional[List[str]] = None,
     report: str = "",
     violations: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
-    """PR description: visible UnifAI report first, stubs next, full report folded."""
+    """PR description: UnifAI report first, full scan report folded. Stub files are
+    on the branch itself — they are not listed in this body."""
     violations = violations or []
+    if "## No Files Changed" in (report or ""):
+        report = ""
     report_says_violations = "violations_found" in (report or "")
     status_label = "❌ Not Compliant" if (violations or report_says_violations) else "✅ Compliant"
     lines: List[str] = [
@@ -1100,41 +1092,7 @@ def _build_fix_pr_body(
     elif not violations and not report_says_violations:
         lines += ["No violations found.", ""]
 
-    files_list = "\n".join(f"- `{f}`" for f in committed)
-    stub_block = [
-        "---",
-        "",
-        "## UniFAI Guardrail Stub Insertion",
-        "",
-        f"Automated guardrail stubs for `{branch}` at `{sha_short}`.",
-        "",
-        "Each stub posts the crossing payload to `POST {GR_SERVICE_URL}/enforce` "
-        "(a small `gr_check()`/`GrClient` helper, inlined once per file — no extra "
-        "dependency to install). Set these environment variables where this code "
-        "actually runs: `GR_SERVICE_URL` (required), and one of "
-        "`GR_BEARER_TOKEN` / `LINEAJE_PAT_TOKEN` / `LINEAJE_PAT` for auth. Without "
-        "`GR_SERVICE_URL` set, every stub fails open (passes data through unchecked).",
-        "",
-        f"### Files updated ({len(committed)})",
-        "",
-        files_list,
-        "",
-    ]
-    failed = failed_files or []
-    if failed:
-        failed_list = "\n".join(f"- `{f}`" for f in failed)
-        stub_block += [
-            f"<details><summary>Sites skipped ({len(failed)})</summary>",
-            "",
-            failed_list,
-            "",
-            "</details>",
-            "",
-        ]
-    else:
-        stub_block += ["### Sites skipped", "", "_None_", ""]
-
-    prefix_len = len("\n".join(lines + stub_block))
+    prefix_len = len("\n".join(lines))
     remaining = GITHUB_PR_BODY_SAFE_LIMIT - prefix_len - 400
 
     policy_section = _extract_markdown_section(report, "SECTION 2: Policy Violations")
@@ -1142,8 +1100,6 @@ def _build_fix_pr_body(
         section_budget = min(8_000, max(500, remaining // 4))
         lines += ["---", "", _clip_github_report(policy_section, max_chars=section_budget), ""]
         remaining -= section_budget
-
-    lines += stub_block
 
     if report and report.strip() and remaining > 500:
         lines += [
@@ -1435,8 +1391,6 @@ def _create_fix_pr(
     pr_body = _build_fix_pr_body(
         branch=branch,
         sha_short=sha_short,
-        committed=committed,
-        failed_files=failed_files,
         report=report,
         violations=violations,
     )
@@ -1454,8 +1408,6 @@ def _create_fix_pr(
         fallback = _build_fix_pr_body(
             branch=branch,
             sha_short=sha_short,
-            committed=committed,
-            failed_files=failed_files,
             report="",
             violations=[],
         )
@@ -1570,7 +1522,7 @@ def _execute_scan(args: argparse.Namespace) -> int:
         elapsed, len(all_violations), len(all_aibom), failed_batches_count,
     )
 
-    combined_report = "\n\n---\n\n".join(r for r in all_reports if r)
+    combined_report = _combine_scan_reports(all_reports)
 
     if failed_batches_count and not all_violations:
         output = build_json_output(
