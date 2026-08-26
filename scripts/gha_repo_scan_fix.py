@@ -999,15 +999,19 @@ _LOCAL_STUB_MAX_FILES = 200
 
 
 def _ensure_insertion_point_scanner_on_path() -> None:
-    """Make ``import insertion_point_scanner`` work on a GitHub Actions runner.
+    """Make ``import insertion_point_scanner`` work — IF it's ever co-deployed.
 
-    Two layouts exist:
-      1. Action deploy: this script AND insertion_point_scanner.py sit together
-         in ``.lineaje-scanner/scripts/`` (``python path/to/gha_repo_scan.py``
-         already puts that dir on sys.path[0] — still add it explicitly).
-      2. This repo: ``scripts/gha_repo_scan.py`` with the scanner at repo root.
-         Running ``python scripts/gha_repo_scan.py`` puts ``scripts/`` on
-         sys.path, NOT the parent, so the import fails without this.
+    NOTE: the real GitHub Actions deploy only ships this file into a
+    customer's ``.lineaje-scanner/scripts/`` — insertion_point_scanner.py is
+    NOT included, so that import always raises ModuleNotFoundError there
+    (confirmed in production; see the comment at this module's
+    local-stub-insertion call site, which no longer calls this path for
+    exactly that reason). This function and the two below it
+    (``local_stub_insertions_from_checkout`` / ``try_local_stub_insertions_
+    from_checkout``) are kept only because unit tests exercise them from
+    inside this repo, where the scanner genuinely is importable at repo
+    root — do not wire them back into the standalone runner path without
+    also fixing the deploy step to actually include insertion_point_scanner.py.
     """
     here = os.path.dirname(os.path.abspath(__file__))
     parent = os.path.dirname(here)
@@ -1961,30 +1965,21 @@ def _execute_scan(args: argparse.Namespace) -> int:
         ]
 
     if should_create_pr and not validated_fixes and all_violations:
-        # Legacy fallback here used to import `gha_stub_insertion`, which
-        # required this repo's full pipeline/stub/guardrail_stub_insertion.py
-        # package on the runner — never true for a truly standalone script
-        # (only this file + insertion_point_scanner.py are deployed into a
-        # customer's .lineaje-scanner/scripts/), so it always threw
-        # ModuleNotFoundError here and silently skipped the fix PR. Replaced
-        # with a local scan via insertion_point_scanner.scan_project() — the
-        # same deterministic candidate detector analyze_uploaded_archive uses
-        # server-side — feeding its output through apply_stub_insertions_to_clone()
-        # above (same function, same validated-Python-syntax guarantee) so this
-        # path and the MCP-provided one behave identically.
+        # No local insertion-point fallback here: this file is deployed
+        # standalone into a customer's .lineaje-scanner/scripts/ on a GitHub
+        # Actions runner — nothing else from this repo (config.py,
+        # insertion_point_scanner.py, pipeline/stub/*) ships alongside it, and
+        # it must not assume otherwise. An earlier version of this fallback
+        # tried `import insertion_point_scanner`, which is never present on a
+        # real runner and always raised ModuleNotFoundError here, surfacing a
+        # scary top-level "Error" on an otherwise-successful scan. If MCP
+        # returned 0 applyable stubs, there is nothing safe to commit — skip
+        # the fix PR and say so; the scan/report above is unaffected.
         logger.info(
-            "MCP returned 0 applyable stubs; scanning locally for insertion points "
-            "so --create-fix-pr can open a PR (%d violation(s) found)",
+            "MCP returned 0 applyable stubs — skipping fix PR (%d violation(s) found, "
+            "no local stub-insertion fallback in this standalone script)",
             len(all_violations),
         )
-        validated_fixes, failed_rem_files, fix_table, local_err = (
-            try_local_stub_insertions_from_checkout(
-                source_path, file_list, all_violations,
-                lineaje_pat=_scan_refresh_token(args),
-            )
-        )
-        if local_err:
-            failure_details.append(local_err)
 
     if should_create_pr and validated_fixes:
         logger.info("Creating stub PR (%d file(s))", len(validated_fixes))
