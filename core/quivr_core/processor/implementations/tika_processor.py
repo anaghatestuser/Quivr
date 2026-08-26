@@ -1,3 +1,27 @@
+# Copyright (c) Lineaje, Inc. All rights reserved.
+# Lineaje UnifAI guardrail  version=2.0.0-alpha
+def _lineaje_load_gr_client():
+    """Lineaje-added: load gr_stub_client.py without a pip dependency."""
+    import sys as _lineaje_sys, os as _lineaje_os, importlib.util as _lineaje_ilu
+    if "_lineaje_gr_stub_client" in _lineaje_sys.modules:
+        return _lineaje_sys.modules["_lineaje_gr_stub_client"]
+    _here = _lineaje_os.path.dirname(_lineaje_os.path.abspath(__file__))
+    _cur, _path = _here, _lineaje_os.path.join(_here, "gr_stub_client.py")
+    for _ in range(8):
+        _cand = _lineaje_os.path.join(_cur, "gr_stub_client.py")
+        if _lineaje_os.path.isfile(_cand):
+            _path = _cand
+            break
+        _parent = _lineaje_os.path.dirname(_cur)
+        if _parent == _cur:
+            break
+        _cur = _parent
+    _spec = _lineaje_ilu.spec_from_file_location("_lineaje_gr_stub_client", _path)
+    _mod = _lineaje_ilu.module_from_spec(_spec)
+    _lineaje_sys.modules["_lineaje_gr_stub_client"] = _mod
+    _spec.loader.exec_module(_mod)
+    return _mod
+
 import logging
 import os
 from typing import AsyncIterable
@@ -57,6 +81,10 @@ class TikaProcessor(ProcessorBase):
         while retry < self.max_retries:
             try:
                 resp = await self._client.put(self.tika_url, headers=headers, content=f)
+                # LINEAJE: enforce() `resp` at api->agent post_tool — scan flagged AI_DAT_SEC_023 (Redact PII from uploaded files.); AI_DAT_SEC_024 (Uploaded files must not contain PII (Singapore).). Mask/block; do not remove without review. site_id='site:sha256:4b831e98cf2fe5db3bbeac68440e0b35a72bcfce54e2546662bd648247e58c98'
+                _gr_client = _lineaje_load_gr_client()
+                _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:4b831e98cf2fe5db3bbeac68440e0b35a72bcfce54e2546662bd648247e58c98', phase='post_tool', boundary={'source': 'external_endpoint', 'sink': 'agent_message'}, candidate_policies=[], fail_mode='ALLOW_WITH_AUDIT', source_type='api', destination_type='agent')
+                resp = await __import__('asyncio').to_thread(lambda: _gr_client.enforce(_gr_site, resp, content_type='application/json', variable_name='resp', source_file=__file__, before_line=59))
                 resp.raise_for_status()
                 return resp.content.decode("utf-8")
             except Exception as e:
