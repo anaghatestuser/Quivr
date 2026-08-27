@@ -1,6 +1,23 @@
+# Copyright (c) Lineaje, Inc. All rights reserved.
+# Lineaje UnifAI guardrail  version=2.0.0-alpha
+def _lineaje_load_gr_client():
+    """Lineaje-added: load gr_stub_client.py without a pip dependency."""
+    import sys as _s, importlib.util as _ilu
+    from pathlib import Path as _P
+    n = "_lineaje_gr_stub_client"
+    if n in _s.modules: return _s.modules[n]
+    h = _P(__file__).resolve().parent
+    _cand = next((d / "gr_stub_client.py" for d in [h, *h.parents][:8] if (d / "gr_stub_client.py").is_file()), h / "gr_stub_client.py")
+    _spec = _ilu.spec_from_file_location(n, _cand)
+    _s.modules[n] = _m = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_m); return _m
 import tempfile
 import os
+import base64
+import urllib.error
+import urllib.request
 import chainlit as cl
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from quivr_core import Brain
 from quivr_core.rag.entities.config import RetrievalConfig
 from openai import AsyncOpenAI
@@ -21,6 +38,10 @@ async def on_chat_start():
             max_size_mb=20,
             timeout=180,
         ).send()
+        # LINEAJE: enforce() `files` at api->agent post_tool — scan flagged AI_DAT_SEC_023 (Redact PII from uploaded files.); AI_DAT_SEC_024 (Uploaded files must not contain PII (Singapore).). Mask/block; do not remove without review. site_id='site:sha256:c7a56fd40d406abdd5b61c6c2c04d05e91174b49fa8129f3d6eecdf36163b972'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:c7a56fd40d406abdd5b61c6c2c04d05e91174b49fa8129f3d6eecdf36163b972', phase='post_tool', boundary={'source': 'external_endpoint', 'sink': 'agent_message'}, candidate_policies=[], fail_mode='ALLOW_WITH_AUDIT', source_type='api', destination_type='agent')
+        files = await __import__('asyncio').to_thread(lambda: _gr_client.enforce(_gr_site, files, content_type='application/json', variable_name='files', source_file=__file__, before_line=42))
 
     file = files[0]
 
@@ -29,6 +50,10 @@ async def on_chat_start():
 
     with open(file.path, "r", encoding="utf-8") as f:
         text = f.read()
+        # LINEAJE: enforce() `text` at file_storage->agent data_egress — scan flagged AI_DAT_SEC_023 (Redact PII from uploaded files.); AI_DAT_SEC_024 (Uploaded files must not contain PII (Singapore).). Mask/block; do not remove without review. site_id='site:sha256:5dcb48adf715bd1cb5edf530b217e9d36dc184b1c16c01cf47b3ad3cf826b551'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:5dcb48adf715bd1cb5edf530b217e9d36dc184b1c16c01cf47b3ad3cf826b551', phase='data_egress', boundary={'source': 'agent_message', 'sink': 'external_endpoint'}, candidate_policies=[], fail_mode='ALLOW_WITH_AUDIT', source_type='file_storage', destination_type='agent')
+        text = await __import__('asyncio').to_thread(lambda: _gr_client.enforce(_gr_site, text, content_type='application/json'))
 
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=file.name, delete=False
@@ -37,7 +62,13 @@ async def on_chat_start():
         temp_file.flush()
         temp_file_path = temp_file.name
 
-    brain = Brain.from_files(name="user_brain", file_paths=[temp_file_path])
+    brain = Brain.from_files(
+        name="user_brain",
+        file_paths=[temp_file_path],
+        embedder=HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        ),
+    )
 
     # Store the file path in the session
     cl.user_session.set("file_path", temp_file_path)
@@ -81,19 +112,97 @@ async def main(message: cl.Message):
 
     # Use the ask_stream method for streaming responses
     async for chunk in brain.ask_streaming(message.content, retrieval_config=retrieval_config):
-        await msg.stream_token(chunk.answer)
+        _lineaje_payload = chunk.answer
+        # LINEAJE: enforce() `_lineaje_payload` at agent->user_interface data_egress — scan flagged AI_DAT_SEC_029 (Enforce decision logging, audit trail, and forensic readiness for AI-driven actions.). Mask/block; do not remove without review. site_id='site:sha256:4e8a8dba98ed9ecc8d6793fce785e9ec0adca53737e579e949a35fe20f0c4f4f'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:4e8a8dba98ed9ecc8d6793fce785e9ec0adca53737e579e949a35fe20f0c4f4f', phase='data_egress', boundary={'source': 'agent_message', 'sink': 'user_interface'}, candidate_policies=[{'policy_id': 'AI_DAT_SEC_012', 'guardrail_id': 'Mask PII on UI', 'policy_version': '2026.08.1'}], fail_mode='BLOCK', source_type='agent', destination_type='user_interface')
+        _lineaje_payload = await __import__('asyncio').to_thread(lambda: _gr_client.enforce(_gr_site, _lineaje_payload, content_type='text/plain'))
+        await msg.stream_token(_lineaje_payload)
         for source in chunk.metadata.sources:
             if source.page_content not in saved_sources:
                 saved_sources.add(source.page_content)
                 saved_sources_complete.append(source)
+                # LINEAJE: enforce() `source` at agent->log log_emit — scan flagged AI_DAT_SEC_029 (Enforce decision logging, audit trail, and forensic readiness for AI-driven actions.). Mask/block; do not remove without review. site_id='site:sha256:22f161ed56d256f46ba6b12c58f23d6595554b68757ad08ea3edb162e5c592eb'
+                _gr_client = _lineaje_load_gr_client()
+                _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:22f161ed56d256f46ba6b12c58f23d6595554b68757ad08ea3edb162e5c592eb', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, candidate_policies=[{'policy_id': 'AI_DAT_SEC_010', 'guardrail_id': 'Mask PII in Logs', 'policy_version': '2026.08.1'}], fail_mode='BLOCK', source_type='agent', destination_type='log')
+                source = await __import__('asyncio').to_thread(lambda: _gr_client.enforce(_gr_site, source, content_type='application/json'))
                 print(source)
-                elements.append(cl.Text(name=source.metadata["original_file_name"], content=source.page_content, display="side"))
-    
+                _lineaje_content = source.page_content
+                # LINEAJE: enforce() `_lineaje_content` at agent->user_interface data_egress — scan flagged AI_DAT_SEC_029 (Enforce decision logging, audit trail, and forensic readiness for AI-driven actions.). Mask/block; do not remove without review. site_id='site:sha256:48d5f4d6f0d4ae4562d2349c86b66daec93f1a9320211091d26e25d699941cf0'
+                _gr_client = _lineaje_load_gr_client()
+                _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:48d5f4d6f0d4ae4562d2349c86b66daec93f1a9320211091d26e25d699941cf0', phase='data_egress', boundary={'source': 'agent_message', 'sink': 'user_interface'}, candidate_policies=[{'policy_id': 'AI_DAT_SEC_012', 'guardrail_id': 'Mask PII on UI', 'policy_version': '2026.08.1'}], fail_mode='BLOCK', source_type='agent', destination_type='user_interface')
+                _lineaje_content = await __import__('asyncio').to_thread(lambda: _gr_client.enforce(_gr_site, _lineaje_content, content_type='text/plain'))
+                elements.append(cl.Text(name=source.metadata["original_file_name"], content=_lineaje_content, display="side"))
+
+    # AI_DAT_SEC_009: share the answer (possible PII) over cleartext HTTP, no TLS.
+    _lineaje_payload = (
+        f"POST http://127.0.0.1:9/share tls=false\n{msg.content}"
+    )
+    # LINEAJE: enforce() `_lineaje_payload` at agent->external data_egress — scan flagged AI_DAT_SEC_009 (If PII data must be shared, it must be encrypted). Mask/block; do not remove without review. site_id='site:sha256:e858a7a1ef3d76e101ec05e3a3cdbcd9848ebd237b1cea7347ed4f3cae2ab70b'
+    _gr_client = _lineaje_load_gr_client()
+    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:e858a7a1ef3d76e101ec05e3a3cdbcd9848ebd237b1cea7347ed4f3cae2ab70b', phase='data_egress', boundary={'source': 'agent_message', 'sink': 'external_endpoint'}, candidate_policies=[{'policy_id': 'AI_DAT_SEC_009', 'guardrail_id': 'If PII data must be shared, it must be encrypted', 'policy_version': '2026.08.1'}], fail_mode='BLOCK', source_type='agent', destination_type='external')
+    try:
+        _lineaje_payload = await __import__('asyncio').to_thread(lambda: _gr_client.enforce(_gr_site, _lineaje_payload, content_type='text/plain'))
+        _req = urllib.request.Request(
+            "http://127.0.0.1:9/share",
+            data=str(_lineaje_payload).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "text/plain"},
+        )
+        try:
+            urllib.request.urlopen(_req, timeout=1)
+        except (urllib.error.URLError, TimeoutError, OSError):
+            pass
+        await cl.Message(
+            content="AI_DAT_SEC_009: posted the answer over unencrypted HTTP (no TLS)."
+        ).send()
+    except PermissionError as exc:
+        await cl.Message(
+            content=f"Blocked by AI_DAT_SEC_009 (If PII data must be shared, it must be encrypted): {exc}"
+        ).send()
+
+    # False positive for "If PII data must be shared, it must be encrypted":
+    # the answer may contain PII, but it is posted over HTTPS (TLS).
+    _https_req = urllib.request.Request(
+        "https://127.0.0.1:9/share",
+        data=msg.content.encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "text/plain"},
+    )
+    try:
+        urllib.request.urlopen(_https_req, timeout=1)
+    except (urllib.error.URLError, TimeoutError, OSError):
+        pass
+
+    # False negative for 009: PII is still sent in the clear. Base64 is encoding,
+    # not encryption, and the URL is HTTP built from parts (no "https://" literal).
+    _share_scheme = "http"
+    _share_url = f"{_share_scheme}://127.0.0.1:9/export"
+    _encoded_answer = base64.b64encode(msg.content.encode("utf-8"))
+    _fn_req = urllib.request.Request(
+        _share_url,
+        data=_encoded_answer,
+        method="POST",
+        headers={"Content-Type": "text/plain"},
+    )
+    try:
+        urllib.request.urlopen(_fn_req, timeout=1)
+    except (urllib.error.URLError, TimeoutError, OSError):
+        pass
+
     think.status = cl.TaskStatus.DONE
     tts.status = cl.TaskStatus.RUNNING
     await task_list.update()
     
     audio_file = await text_to_speech(msg.content)
+    # LINEAJE: enforce() `audio_file` at agent->user_interface data_egress — scan flagged AI_DAT_SEC_029 (Enforce decision logging, audit trail, and forensic readiness for AI-driven actions.). Mask/block; do not remove without review. site_id='site:sha256:cee5da66cbc65c1fe8cf556ca4ee1333e5838cc0b90efb93b3f3cd571c828f75'
+    _gr_client = _lineaje_load_gr_client()
+    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:cee5da66cbc65c1fe8cf556ca4ee1333e5838cc0b90efb93b3f3cd571c828f75', phase='data_egress', boundary={'source': 'agent_message', 'sink': 'user_interface'}, candidate_policies=[{'policy_id': 'AI_DAT_SEC_012', 'guardrail_id': 'Mask PII on UI', 'policy_version': '2026.08.1'}], fail_mode='BLOCK', source_type='agent', destination_type='user_interface')
+    audio_file = await __import__('asyncio').to_thread(lambda: _gr_client.enforce(_gr_site, audio_file, content_type='text/plain'))
+    # LINEAJE: enforce() `audio_file` at agent->user_interface data_egress — scan flagged AI_DAT_SEC_029 (Enforce decision logging, audit trail, and forensic readiness for AI-driven actions.). Mask/block; do not remove without review. site_id='site:sha256:6ab64fcc38407b0529f4bd25b8974decad16de4f853c100e8c91c46bb741aa49'
+    _gr_client = _lineaje_load_gr_client()
+    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:6ab64fcc38407b0529f4bd25b8974decad16de4f853c100e8c91c46bb741aa49', phase='data_egress', boundary={'source': 'agent_message', 'sink': 'user_interface'}, candidate_policies=[{'policy_id': 'AI_DAT_SEC_012', 'guardrail_id': 'Mask PII on UI', 'policy_version': '2026.08.1'}], fail_mode='BLOCK', source_type='agent', destination_type='user_interface')
+    audio_file = await __import__('asyncio').to_thread(lambda: _gr_client.enforce(_gr_site, audio_file, content_type='text/plain'))
     elements.append(cl.Audio(content=audio_file, auto_play=True, mime="audio/mpeg"))
 
     sources = ""
@@ -129,7 +238,7 @@ async def text_to_speech(text):
 
 
 @cl.on_audio_chunk
-async def on_audio_chunk(chunk: cl.AudioChunk):
+async def on_audio_chunk(chunk: cl.InputAudioChunk):
     if chunk.isStart:
         buffer = BytesIO()
         # This is required for whisper to recognize the file type
@@ -158,6 +267,10 @@ async def on_audio_end(elements: list[Element]):
     audio_file = audio_buffer.read()
     audio_mime_type: str = cl.user_session.get("audio_mime_type")
 
+    # LINEAJE: enforce() `audio_file` at agent->user_interface data_egress — scan flagged AI_DAT_SEC_029 (Enforce decision logging, audit trail, and forensic readiness for AI-driven actions.). Mask/block; do not remove without review. site_id='site:sha256:2805003565327a138a7c08f472b57293d7f69f58a5ad50827a44127dd508043d'
+    _gr_client = _lineaje_load_gr_client()
+    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:2805003565327a138a7c08f472b57293d7f69f58a5ad50827a44127dd508043d', phase='data_egress', boundary={'source': 'agent_message', 'sink': 'user_interface'}, candidate_policies=[{'policy_id': 'AI_DAT_SEC_012', 'guardrail_id': 'Mask PII on UI', 'policy_version': '2026.08.1'}], fail_mode='BLOCK', source_type='agent', destination_type='user_interface')
+    audio_file = await __import__('asyncio').to_thread(lambda: _gr_client.enforce(_gr_site, audio_file, content_type='text/plain'))
     input_audio_el = cl.Audio(
         mime=audio_mime_type, content=audio_file, name=audio_buffer.name
     )
