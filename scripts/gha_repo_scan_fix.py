@@ -85,60 +85,12 @@ logger = logging.getLogger("gha_repo_scan")
 # This script is deployed on its own into a target repo's
 # .lineaje-scanner/scripts/ by the GitHub Action — the rest of the
 # aipo_mcp_server repo (including config.py) is not present there, so it
-# must not import from config.py or anywhere else in this repo. Everything
-# below is a straight copy of config.py's MANIFEST_FILE_PATTERNS /
-# ARCHIVE_EXCLUDE_* / list_files_for_archive() / EVIDENCE_TYPE_SCM_SCAN —
-# keep both copies in sync if the source changes.
+# must not import from config.py or anywhere else in this repo.
+# Do not classify dependency manifests here. Pack lockfiles/toml/etc. in the
+# archive; mcp_server.py routes them to CLI Integration and excludes them
+# from policy scan.
 
 EVIDENCE_TYPE_SCM_SCAN = "scm_scan"
-
-MANIFEST_FILE_PATTERNS: frozenset = frozenset(
-    {
-        # Python
-        "requirements.txt", "requirements-dev.txt", "requirements-test.txt",
-        "Pipfile", "Pipfile.lock", "pyproject.toml", "setup.py", "setup.cfg",
-        "poetry.lock",
-        # Python — conda
-        "environment.yml", "environment.yaml",
-        # JavaScript/Node.js
-        "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock",
-        # Java
-        "pom.xml", "build.gradle", "build.gradle.kts", "gradle.lockfile",
-        # Scala
-        "build.sbt",
-        # Ruby
-        "Gemfile", "Gemfile.lock",
-        # Go
-        "go.mod", "go.sum",
-        # Rust
-        "Cargo.toml", "Cargo.lock",
-        # .NET
-        "packages.config", "packages.lock.json", "*.csproj", "*.fsproj",
-        "*.vbproj", "nuget.config", "Directory.Packages.props",
-        # PHP
-        "composer.json", "composer.lock",
-        # Swift
-        "Package.swift", "Package.resolved",
-        # Dart / Flutter
-        "pubspec.yaml", "pubspec.lock",
-        # Elixir
-        "mix.exs", "mix.lock",
-        # Ruby gemspec
-        "*.gemspec",
-    }
-)
-
-
-def _is_manifest_file(name: str) -> bool:
-    """True if *name* matches ``MANIFEST_FILE_PATTERNS`` (exact or glob)."""
-    if name in MANIFEST_FILE_PATTERNS:
-        return True
-    return any(
-        fnmatch.fnmatch(name, pat)
-        for pat in MANIFEST_FILE_PATTERNS
-        if "*" in pat or "?" in pat
-    )
-
 
 ARCHIVE_EXCLUDE_DIRS: frozenset = frozenset(
     {
@@ -161,8 +113,6 @@ ARCHIVE_EXCLUDE_GLOBS: frozenset = frozenset(
     {
         "*.secret", "*.key", "*.pem", "*.env.*",
         "*.zip", "*.tar", "*.tar.gz", "*.jar", "*.war", "*.swp", "*.swo",
-        "*.lock", "package-lock.json", "yarn.lock", "Pipfile.lock",
-        "poetry.lock", "Gemfile.lock", "Cargo.lock", "composer.lock",
         "*.min.js", "*.min.css", "*.map",
         "*_pb2.py", "*.pb.go", "*.pb.cc", "*.pb.h",
         "*.snap",
@@ -189,16 +139,17 @@ def _git_ls_files_archive_command(repo_path: str) -> List[str]:
     """``git ls-files`` argv that skips the same paths the upload archive tool skips.
 
     ``--exclude-standard`` honors ``.gitignore``. ``-x`` drops matching *untracked*
-    files. ``:(exclude,glob)`` pathspecs also drop *tracked* vendor dirs, lockfiles,
-    binaries, and dependency manifests so a GHA checkout does not pack them.
+    files. ``:(exclude,glob)`` pathspecs also drop *tracked* vendor dirs and
+    binaries. Lockfiles and other dependency manifests stay in the archive;
+    mcp_server.py routes them to CLI Integration and keeps them out of eval.
     """
+    exclude_globs = tuple(sorted(ARCHIVE_EXCLUDE_GLOBS))
     cmd: List[str] = [
         "git", "-C", repo_path, "ls-files", "-z", "--cached", "--others", "--exclude-standard",
     ]
     x_patterns: List[str] = [
         *sorted(ARCHIVE_EXCLUDE_DIRS),
-        *sorted(ARCHIVE_EXCLUDE_GLOBS),
-        *sorted(MANIFEST_FILE_PATTERNS),
+        *exclude_globs,
         *[f"*{ext}" for ext in sorted(BINARY_EXTENSIONS)],
         *_ARCHIVE_EXCLUDE_DIR_GLOBS,
     ]
@@ -210,7 +161,7 @@ def _git_ls_files_archive_command(repo_path: str) -> List[str]:
         cmd.append(f":(exclude,glob){name}/**")
         cmd.append(f":(exclude,glob)**/{name}")
         cmd.append(f":(exclude,glob)**/{name}/**")
-    for pat in (*sorted(ARCHIVE_EXCLUDE_GLOBS), *sorted(MANIFEST_FILE_PATTERNS)):
+    for pat in exclude_globs:
         cmd.append(f":(exclude,glob){pat}")
         if not pat.startswith("**/"):
             cmd.append(f":(exclude,glob)**/{pat}")
@@ -272,11 +223,9 @@ def _walk_files_for_archive(root: str) -> List[str]:
             ext = pathlib.Path(fname).suffix.lower()
             if ext in BINARY_EXTENSIONS:
                 continue
-            if _is_manifest_file(fname):
+            if any(part in ARCHIVE_EXCLUDE_DIRS for part in pathlib.Path(rel_path).parts):
                 continue
             if any(fnmatch.fnmatch(rel_path, g) for g in ARCHIVE_EXCLUDE_GLOBS):
-                continue
-            if any(part in ARCHIVE_EXCLUDE_DIRS for part in pathlib.Path(rel_path).parts):
                 continue
             file_list.append(rel_path)
     return file_list
@@ -456,9 +405,9 @@ def _combine_scan_reports(reports: List[str]) -> str:
 # ===========================================================================
 
 # MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
-MCP_SERVER_URL = "https://mcp.commercialdev.dev.veedna.com/mcp/"
+MCP_SERVER_URL = "https://mcp.commercialdev.dev.veedna.com/mcp"
 
-MAX_SCAN_WORKERS = 4
+MAX_SCAN_WORKERS = 10  # keep in sync with config.py's MAX_SCAN_WORKERS (self-contained script, no import)
 REMEDIATION_BRANCH_PREFIX = "remediation/unifai-gha"
 DEFAULT_UNIFAI_FILE_BATCH_SIZE = 100
 # GitHub rejects POST /pulls with HTTP 422 when body > 65536 chars.
@@ -825,6 +774,73 @@ def create_batch_archive(
     return archive_path
 
 
+def _build_batch_file_contents(
+    source_dir: str,
+    file_subset: List[str],
+    source_code_repo: str,
+    branch: str,
+    head_sha: str,
+    batch_index: int = 0,
+    manifest_files: Optional[List[str]] = None,
+) -> Dict[str, str]:
+    """Read a batch's files (+ manifests) as text for get_upload_url's `files`
+    param — no local .tar.gz needed for the upload itself (mcp_server.py
+    builds the tarball server-side from this dict). Mirrors
+    create_batch_archive's file selection and embedded user_metadata.json
+    exactly, just built as an in-memory dict instead of written to disk.
+    """
+    extra_manifests = [m for m in (manifest_files or []) if m not in file_subset]
+    all_files = list(file_subset) + extra_manifests
+    contents: Dict[str, str] = {}
+    for rel_path in all_files:
+        full_path = os.path.join(source_dir, rel_path)
+        if os.path.isfile(full_path):
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                contents[rel_path] = f.read()
+    metadata = {
+        "scan_source": "gha_repo_scan",
+        "repo": source_code_repo,
+        "branch": branch,
+        "head_sha": head_sha,
+        "scan_type": "full_repository",
+        "evidence_type": EVIDENCE_TYPE_SCM_SCAN,
+        "batch_index": batch_index,
+        "batch_file_count": len(file_subset),
+        "manifest_file_count": len(extra_manifests),
+    }
+    contents["user_metadata.json"] = json.dumps(metadata, indent=2)
+    logger.info(
+        "Batch files payload #%d: %d files + %d manifests",
+        batch_index, len(file_subset), len(extra_manifests),
+    )
+    return contents
+
+
+def _is_payload_too_large(exc: BaseException) -> bool:
+    """True when exc is (or wraps) an HTTP 413 from the MCP endpoint.
+
+    A 413 means a proxy/gateway in front of the MCP server rejected the
+    request body itself — get_upload_url's own files-size guard never even
+    ran. Unlike a transient network blip, retrying the identical payload is
+    guaranteed to 413 again; the caller should split the batch instead of
+    (or before) any blind retry.
+    """
+    cause = exc
+    while hasattr(cause, "exceptions") and cause.exceptions:
+        cause = cause.exceptions[0]
+    try:
+        import httpx
+        if isinstance(cause, httpx.HTTPStatusError) and cause.response is not None:
+            return cause.response.status_code == 413
+    except Exception:
+        pass
+    # Fallback for a transport/wrapper that doesn't preserve the exception
+    # type (e.g. re-raised as a bare RuntimeError with the original message
+    # baked in) — this exact phrase is distinctive enough not to false-match.
+    text = str(cause)
+    return "413" in text and "Request Entity Too Large" in text
+
+
 def _batch_size(total_files: int) -> int:
     raw = (os.environ.get("UNIFAI_FILE_BATCH_SIZE") or "").strip()
     if not raw:
@@ -855,14 +871,93 @@ def _upload_to_s3(presigned_url: str, archive_path: str) -> None:
     logger.info("S3 upload complete")
 
 
+def _loads_scan_payload(raw: str) -> dict:
+    """Parse plain JSON or report-first MCP scan text (stdlib only)."""
+    text = (raw or "").strip()
+    if not text:
+        return {"raw": "empty response"}
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except (json.JSONDecodeError, TypeError):
+        pass
+    marker = "<!-- LINEAJE_MCP_JSON -->"
+    if marker in text:
+        json_part = text.split(marker, 1)[1].strip()
+        try:
+            parsed = json.loads(json_part)
+            if isinstance(parsed, dict):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+    brace = text.rfind("\n{")
+    if brace >= 0:
+        try:
+            parsed = json.loads(text[brace + 1 :])
+            if isinstance(parsed, dict):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return {"raw": text, "report": text}
+
+
 def _parse_tool_result(result: Any) -> dict:
+    for attr in ("structuredContent", "structured_content"):
+        structured = getattr(result, attr, None)
+        if isinstance(structured, dict) and (
+            "report" in structured or "status" in structured or "error" in structured
+        ):
+            return structured
     if hasattr(result, "content") and result.content:
         raw = result.content[0].text if hasattr(result.content[0], "text") else str(result.content[0])
-        try:
-            return json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            return {"raw": raw}
+        return _loads_scan_payload(raw)
     return {"raw": "empty response"}
+
+
+# --- mcp SDK compat shim ----------------------------------------------------
+# ``streamablehttp_client`` (this exact name) was a deprecated alias for the
+# canonical ``streamable_http_client`` in the ``mcp`` PyPI package. Some ``mcp``
+# releases have removed the deprecated alias outright, which breaks on any
+# environment that installs ``mcp`` unpinned (e.g. a CI runner picking up
+# whatever's newest — confirmed live: "ImportError: cannot import name
+# 'streamablehttp_client' from 'mcp.client.streamable_http'"). Reimplemented
+# here against the still-supported ``streamable_http_client`` so every call
+# site below keeps working unchanged regardless of which alias the installed
+# mcp version kept. Logic mirrors the (now possibly-removed) deprecated
+# wrapper's own implementation exactly — same signature, same behavior.
+from contextlib import asynccontextmanager as _asynccontextmanager
+from datetime import timedelta as _timedelta
+
+
+@_asynccontextmanager
+async def streamablehttp_client(
+    url,
+    headers=None,
+    timeout=30,
+    sse_read_timeout=60 * 5,
+    terminate_on_close=True,
+    httpx_client_factory=None,
+    auth=None,
+):
+    import httpx
+    from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
+
+    factory = httpx_client_factory or create_mcp_http_client
+    timeout_seconds = timeout.total_seconds() if isinstance(timeout, _timedelta) else timeout
+    sse_read_timeout_seconds = (
+        sse_read_timeout.total_seconds() if isinstance(sse_read_timeout, _timedelta) else sse_read_timeout
+    )
+    client = factory(
+        headers=headers,
+        timeout=httpx.Timeout(timeout_seconds, read=sse_read_timeout_seconds),
+        auth=auth,
+    )
+    async with client:
+        async with streamable_http_client(
+            url, http_client=client, terminate_on_close=terminate_on_close,
+        ) as streams:
+            yield streams
 
 
 def _run_mcp_scan_via_client(
@@ -873,16 +968,28 @@ def _run_mcp_scan_via_client(
     files_to_scan: List[str],
     archive_path: str,
     head_sha: str = "",
+    is_last_batch: bool = True,
 ) -> Dict[str, Any]:
-    from mcp.client.streamable_http import streamablehttp_client
     from mcp import ClientSession
 
     async def _scan() -> Dict[str, Any]:
-        upload_args: Dict[str, Any] = {
+        base_args: Dict[str, Any] = {
             "source_code_repo": source_code_repo,
             "branch_or_tag": branch,
             "files_to_scan": files_to_scan,
         }
+        # CI/scripts path (get_upload_url's own docstring): call it with NONE
+        # of local_archive_path/archive_content_base64/files, and it returns a
+        # bare presigned_url without uploading anything itself. We then PUT
+        # the already-built batch archive straight to S3 ourselves. Unlike
+        # `files={...}` (every file's content embedded in THIS request's own
+        # JSON body, routed through the MCP endpoint), this PUT goes directly
+        # to S3 — it never passes through whatever proxy/gateway sits in
+        # front of the MCP endpoint, so it isn't subject to that transport's
+        # request-body-size limit. `files={...}` could 413 there even after
+        # splitting a batch down to a single oversized file — a floor no
+        # amount of client-side re-batching can get under.
+        upload_args: Dict[str, Any] = dict(base_args)
         # Only known to the SCM/CI script — a coding agent (Cursor/Claude Code) has no
         # way to set a custom transport header, so this signal cannot leak into IDE scans.
         scm_headers: Dict[str, str] = {"X-Unifai-Commit-Sha": head_sha} if head_sha else {}
@@ -900,9 +1007,18 @@ def _run_mcp_scan_via_client(
                 if not upload_result.get("success"):
                     raise RuntimeError(f"get_upload_url failed: {upload_result.get('error', upload_result)}")
                 archive_id = upload_result["archive_id"]
-                presigned_url = upload_result["presigned_url"]
+                presigned_url = upload_result.get("presigned_url")
 
-        logger.info("MCP step 2/3: upload to S3")
+        # Calling get_upload_url with no files/local_archive_path/base64
+        # always returns a bare presigned_url and never uploads anything
+        # itself (see its docstring's CI/scripts branch). Missing one here
+        # means the server's contract changed underneath us.
+        if not presigned_url:
+            raise RuntimeError(
+                "get_upload_url did not return presigned_url for a files-less "
+                f"request — unexpected server response: {upload_result!r}"
+            )
+        logger.info("MCP step 2/3: uploading batch archive to S3 directly")
         _upload_to_s3(presigned_url, archive_path)
 
         tok2 = bearer_getter()
@@ -915,7 +1031,7 @@ def _run_mcp_scan_via_client(
             async with ClientSession(read2, write2) as session2:
                 await session2.initialize()
                 logger.info("MCP step 3/3: analyze_uploaded_archive (timeout=%ds)", sse_timeout)
-                analyze_args = dict(upload_args)
+                analyze_args = dict(base_args)
                 analyze_args["archive_id"] = archive_id
                 # We already know the exact URL we used to reach this server -- more
                 # reliable than any guess the server itself could make about its own
@@ -923,6 +1039,7 @@ def _run_mcp_scan_via_client(
                 # server-side default) and gets the server's own resolution instead.
                 analyze_args["mcp_server_location"] = server_url
                 analyze_args["scan_type"] = EVIDENCE_TYPE_SCM_SCAN
+                analyze_args["is_last_batch"] = is_last_batch
                 result = _parse_tool_result(
                     await session2.call_tool("analyze_uploaded_archive", arguments=analyze_args)
                 )
@@ -939,10 +1056,25 @@ def run_mcp_scan(
     files_to_scan: List[str],
     archive_path: str,
     head_sha: str = "",
+    is_last_batch: bool = True,
 ) -> Dict[str, Any]:
+    """is_last_batch=False buffers this batch's entities/findings server-side
+    instead of uploading (see uploader.py's upload_pipeline_results_batched) —
+    pass it for every call of a multi-batch scan except the final one, so the
+    whole scan produces exactly one entities PUT and one findings PUT instead
+    of one pair per batch. Default True matches a single-batch scan's
+    existing immediate-upload behavior.
+
+    archive_path (from create_batch_archive) is PUT directly to S3 via a
+    presigned URL from get_upload_url's CI/scripts (files-less) branch —
+    chosen over `files={...}` specifically because the PUT bypasses the MCP
+    endpoint's own request-body-size limit (a plain S3 PUT has no comparable
+    ceiling), where inline file content embedded in the tool-call body does
+    not."""
     logger.info("MCP scan: %d files, repo=%s, branch=%s", len(files_to_scan), source_code_repo, branch)
     return _run_mcp_scan_via_client(
-        server_url, bearer_getter, source_code_repo, branch, files_to_scan, archive_path, head_sha=head_sha,
+        server_url, bearer_getter, source_code_repo, branch, files_to_scan, archive_path,
+        head_sha=head_sha, is_last_batch=is_last_batch,
     )
 
 # ===========================================================================
@@ -1026,6 +1158,91 @@ def validate_python_source(new_content: str, abs_path: str) -> Optional[str]:
         return str(exc)
 
 
+def _norm_stub_relpath(path: str) -> str:
+    """Repo-relative path used only for stub-identity comparison."""
+    p = (path or "").replace("\\", "/").strip()
+    while p.startswith("./"):
+        p = p[2:]
+    p = p.lstrip("/")
+    if os.path.basename(p) == "gr_stub_client.py":
+        return "gr_stub_client.py"
+    return p
+
+
+def _stub_identity_keys(row: Dict[str, Any]) -> list:
+    rel = _norm_stub_relpath(str(row.get("file") or ""))
+    try:
+        line = int(row.get("line") or 0)
+    except (TypeError, ValueError):
+        line = 0
+    ip = str(row.get("insertion_point") or "")
+    site = str(row.get("site_id") or "")
+    keys: list = []
+    if site:
+        keys.append(("site", site))
+    if rel:
+        keys.append(("loc", rel, line, ip))
+        if line == 0 and not ip:
+            keys.append(("file", rel))
+    return keys
+
+
+def _dedupe_stub_insertions(stubs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Collapse overlapping batches / path aliases into one row per site."""
+    seen: set = set()
+    out: List[Dict[str, Any]] = []
+    for s in stubs:
+        if not isinstance(s, dict):
+            out.append(s)
+            continue
+        entry = dict(s)
+        rel = _norm_stub_relpath(str(s.get("file") or ""))
+        if rel:
+            entry["file"] = rel
+        keys = _stub_identity_keys(entry)
+        if keys and any(k in seen for k in keys):
+            if entry.get("new_content"):
+                for i, kept in enumerate(out):
+                    if not isinstance(kept, dict):
+                        continue
+                    kept_keys = _stub_identity_keys(kept)
+                    if any(k in kept_keys for k in keys):
+                        merged = dict(kept)
+                        merged["new_content"] = entry["new_content"]
+                        merged["status"] = "detected"
+                        merged["safe_to_insert"] = True
+                        merged["file"] = rel or merged.get("file") or ""
+                        out[i] = merged
+                        break
+            continue
+        for k in keys:
+            seen.add(k)
+        out.append(entry)
+    return out
+
+
+def _collapse_stub_hits(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen_sites: set = set()
+    seen_loc: set = set()
+    out: List[Dict[str, Any]] = []
+    for hit in sorted(hits, key=lambda h: int(h.get("line") or 0)):
+        site = str(hit.get("site_id") or "")
+        try:
+            line = int(hit.get("line") or 0)
+        except (TypeError, ValueError):
+            line = 0
+        loc = (line, str(hit.get("insertion_point") or ""))
+        if site and site in seen_sites:
+            continue
+        if loc in seen_loc:
+            continue
+        if site:
+            seen_sites.add(site)
+        seen_loc.add(loc)
+        out.append(hit)
+    return out
+
+
 def _stub_insertions_from_mcp_result(mcp_result: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Merge stub_insertions with patched_files / companion_files from the MCP response."""
     stubs = [dict(s) for s in (mcp_result.get("stub_insertions") or [])]
@@ -1033,14 +1250,16 @@ def _stub_insertions_from_mcp_result(mcp_result: Dict[str, Any]) -> List[Dict[st
     for extra in list(mcp_result.get("patched_files") or []) + list(mcp_result.get("companion_files") or []):
         if not isinstance(extra, dict):
             continue
-        rel = (extra.get("file") or "").strip().replace("\\", "/")
+        rel = _norm_stub_relpath(extra.get("file") or "")
         if rel and extra.get("content") is not None:
             by_file[rel] = extra["content"]
     if not by_file:
-        return stubs
+        return _dedupe_stub_insertions(stubs)
     applied: set = set()
     for s in stubs:
-        rel = (s.get("file") or "").strip().replace("\\", "/")
+        rel = _norm_stub_relpath(s.get("file") or "")
+        if rel:
+            s["file"] = rel
         if rel in by_file:
             s["new_content"] = by_file[rel]
             s["status"] = "detected"
@@ -1055,7 +1274,7 @@ def _stub_insertions_from_mcp_result(mcp_result: Dict[str, Any]) -> List[Dict[st
                 "new_content": content,
                 "line": 0,
             })
-    return stubs
+    return _dedupe_stub_insertions(stubs)
 
 
 def apply_stub_insertions_to_clone(
@@ -1070,8 +1289,8 @@ def apply_stub_insertions_to_clone(
     by_file: Dict[str, List[Dict[str, Any]]] = {}
     skipped: List[str] = []
     validated: Dict[str, str] = {}
-    for s in stub_insertions:
-        rel = (s.get("file") or "").strip().replace("\\", "/")
+    for s in _dedupe_stub_insertions(stub_insertions):
+        rel = _norm_stub_relpath(s.get("file") or "")
         if not rel:
             continue
         if s.get("status") != "detected":
@@ -1081,12 +1300,16 @@ def apply_stub_insertions_to_clone(
             # whole file rather than re-applying proposed_stub line-by-line.
             validated[rel] = s["new_content"]
             continue
+        if rel in validated:
+            continue
         if not s.get("safe_to_insert"):
             skipped.append(f"{rel}:{s.get('line', '')} {s.get('skip_reason', '') or 'unsafe'}".strip())
             continue
         by_file.setdefault(rel, []).append(s)
 
     for rel_path, hits in by_file.items():
+        if rel_path in validated:
+            continue
         abs_path = os.path.join(source_dir, rel_path)
         if not os.path.isfile(abs_path):
             skipped.append(f"{rel_path} not found in checkout")
@@ -1098,11 +1321,16 @@ def apply_stub_insertions_to_clone(
 
         # Insert bottom-up so an earlier insertion never shifts a later hit's
         # (already-captured) line number out from under it.
-        sorted_hits = sorted(hits, key=lambda h: h.get("line", 0), reverse=True)
+        sorted_hits = sorted(_collapse_stub_hits(hits), key=lambda h: h.get("line", 0), reverse=True)
         needs_import = False
         for hit in sorted_hits:
             proposed = hit.get("proposed_stub") or ""
             if not proposed:
+                continue
+            site = str(hit.get("site_id") or "")
+            joined = "".join(lines)
+            marker = f"site_id={site!r}" if site else ""
+            if (marker and marker in joined) or proposed in joined:
                 continue
             line = int(hit.get("line") or 0)
             # 1-based line; insert_after=True (result/lhs patterns) must land
@@ -1407,15 +1635,22 @@ def parallel_batch_scan(
     all_stub_insertions: List[Dict[str, Any]] = []
     lock = threading.Lock()
 
-    def _scan_one(batch_idx: int, batch_files: List[str]) -> Tuple[int, Dict[str, Any]]:
+    def _scan_one(
+        batch_idx: int,
+        batch_files: List[str],
+        *,
+        is_last_batch: bool = True,
+    ) -> Tuple[int, Dict[str, Any]]:
         logger.info("Batch %d/%d: %d files", batch_idx, len(batches), len(batch_files))
         archive_path = create_batch_archive(
             source_dir, temp_dir, batch_files,
-            source_code_repo, branch, head_sha, batch_idx, run_id=run_id,
-            manifest_files=manifest_files,
+            source_code_repo, branch, head_sha, batch_idx,
+            # Do not classify manifests here — mcp_server.py routes them to CLI Integration.
+            manifest_files=None,
         )
         result = run_mcp_scan(
-            server_url, bearer_getter, source_code_repo, branch, batch_files, archive_path, head_sha=head_sha,
+            server_url, bearer_getter, source_code_repo, branch, batch_files, archive_path,
+            head_sha=head_sha, is_last_batch=is_last_batch,
         )
         return batch_idx, result
 
@@ -1455,12 +1690,73 @@ def parallel_batch_scan(
                     aibom_seen.add(key)
                     all_aibom.append(entry)
             all_stub_insertions.extend(batch_stub_insertions)
+            all_stub_insertions[:] = _dedupe_stub_insertions(all_stub_insertions)
 
-    def _run_and_collect(batch_idx: int, batch_files: List[str]) -> None:
+    def _run_and_collect(
+        batch_idx: int,
+        batch_files: List[str],
+        *,
+        is_last_batch: bool = True,
+        retry_on_failure: bool = False,
+        _split_label: str = "",
+    ) -> None:
+        label = f"{batch_idx}{_split_label}"
         try:
-            _, mcp_result = _scan_one(batch_idx, batch_files)
+            _, mcp_result = _scan_one(batch_idx, batch_files, is_last_batch=is_last_batch)
             _collect(batch_idx, mcp_result)
         except BaseException as exc:
+            if _is_payload_too_large(exc) and len(batch_files) > 1:
+                # The proxy/gateway in front of the MCP endpoint rejected the
+                # request body itself (413) — get_upload_url's own size guard
+                # never even ran. Retrying the SAME payload would just 413
+                # again (unlike a transient network blip, this is
+                # deterministic), so split this batch in half and retry each
+                # half instead. UNIFAI_FILE_BATCH_SIZE stays file-count-based
+                # (unchanged) — this only kicks in for the rare batch whose
+                # particular files happen to be big enough to still exceed the
+                # transport limit. Halves recurse through this same function,
+                # so a half that's STILL too large keeps splitting on its own.
+                mid = len(batch_files) // 2
+                first_half, second_half = batch_files[:mid], batch_files[mid:]
+                logger.warning(
+                    "Batch %s: 413 Request Entity Too Large (%d files) — "
+                    "splitting into %d + %d files and retrying each half",
+                    label, len(batch_files), len(first_half), len(second_half),
+                )
+                # Only the half that inherits is_last_batch actually finalizes
+                # the scan's accumulated upload — the other half is never the
+                # literal last thing to run for this batch, regardless of
+                # whether the ORIGINAL (unsplit) batch was the final one.
+                _run_and_collect(
+                    batch_idx, first_half, is_last_batch=False,
+                    retry_on_failure=retry_on_failure, _split_label=_split_label + "a",
+                )
+                _run_and_collect(
+                    batch_idx, second_half, is_last_batch=is_last_batch,
+                    retry_on_failure=retry_on_failure, _split_label=_split_label + "b",
+                )
+                return
+            if retry_on_failure:
+                # This is the one call that finalizes the whole scan's
+                # accumulated entities/findings upload server-side (see
+                # uploader.py's upload_pipeline_results_batched) — if it never
+                # lands, every already-buffered batch is stuck server-side and
+                # never reaches S3 at all. One retry here is cheap insurance
+                # against a transient network blip; if the first attempt
+                # actually landed server-side and only the response was lost,
+                # the content-fingerprint duplicate guard in uploader.py makes
+                # the retry a safe no-op PUT-wise rather than a second upload.
+                logger.warning(
+                    "Batch %s (final) failed, retrying once — this call finalizes "
+                    "the whole scan's upload: %s", label, exc,
+                )
+                try:
+                    _, mcp_result = _scan_one(batch_idx, batch_files, is_last_batch=is_last_batch)
+                    _collect(batch_idx, mcp_result)
+                except BaseException as exc2:
+                    exc = exc2
+                else:
+                    return
             nonlocal failed_batch_count
             failed_batch_count += 1
             # Unwrap ExceptionGroup / TaskGroup to surface the real cause
@@ -1469,13 +1765,21 @@ def parallel_batch_scan(
                 cause = exc.exceptions[0]
                 if hasattr(cause, "exceptions") and cause.exceptions:
                     cause = cause.exceptions[0]
-            detail = f"Batch {batch_idx}/{len(batches)} failed: {type(cause).__name__}: {cause}"
+            detail = f"Batch {label}/{len(batches)} failed: {type(cause).__name__}: {cause}"
             logger.error("%s", detail)
             logger.debug("Full exception:", exc_info=exc)
             failure_details.append(detail)
+            if retry_on_failure:
+                logger.error(
+                    "Batch %s (final) failed after retry — every already-buffered batch "
+                    "for this scan will NOT be uploaded (see upload_pipeline_results_batched's "
+                    "no-durability tradeoff)", label,
+                )
 
     if not batches:
         return all_violations, all_reports, all_aibom, failed_batch_count, failure_details, enforce_service_url, all_stub_insertions
+
+    total_batches = len(batches)
 
     # Batch 1 runs alone, first — every batch's get_upload_url call resolves
     # (or creates) the SCIM project for this repo+branch+commit via
@@ -1486,16 +1790,39 @@ def parallel_batch_scan(
     # POSTing a create — duplicate project rows for one repo+branch+commit.
     # Scanning batch 1 to completion first means the project already exists
     # by the time the rest start, so they resolve (not create) it instead.
-    logger.info("Batch 1/%d runs first (alone) so the SCIM project exists before the rest scan in parallel", len(batches))
-    _run_and_collect(1, batches[0])
+    logger.info("Batch 1/%d runs first (alone) so the SCIM project exists before the rest scan in parallel", total_batches)
+    # Single-batch scan: batch 1 is also the only (and thus final) batch —
+    # upload immediately, same as today. Multi-batch: batch 1 buffers,
+    # server-side, like every other non-final batch.
+    _run_and_collect(1, batches[0], is_last_batch=(total_batches == 1))
 
     remaining = list(enumerate(batches[1:], 2))
     if remaining:
-        workers = min(len(remaining), max_workers)
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(_run_and_collect, idx, files) for idx, files in remaining]
-            for future in as_completed(futures):
-                future.result()  # _run_and_collect already caught/recorded its own failure
+        # The literal last batch (by index, not by completion order) must run
+        # only after every other batch has already finished and buffered its
+        # data server-side (see upload_pipeline_results_batched) — batches
+        # completing out of order among themselves is fine, but finalizing
+        # before a slower non-final batch has landed would silently drop that
+        # batch's data from the scan forever. So: run every batch except the
+        # last one in parallel and WAIT for all of them, then run the last
+        # one alone, is_last_batch=True.
+        middle, (final_idx, final_files) = remaining[:-1], remaining[-1]
+        if middle:
+            workers = min(len(middle), max_workers)
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [
+                    executor.submit(_run_and_collect, idx, files, is_last_batch=False)
+                    for idx, files in middle
+                ]
+                for future in as_completed(futures):
+                    future.result()  # _run_and_collect already caught/recorded its own failure
+
+        logger.info(
+            "Batch %d/%d runs last (alone, after every other batch has completed) to "
+            "finalize this scan's single accumulated entities/findings upload",
+            final_idx, total_batches,
+        )
+        _run_and_collect(final_idx, final_files, is_last_batch=True, retry_on_failure=True)
 
     return all_violations, all_reports, all_aibom, failed_batch_count, failure_details, enforce_service_url, all_stub_insertions
 
@@ -2498,14 +2825,12 @@ def _execute_scan(args: argparse.Namespace) -> int:
         print_human_output(output)
         return 0
 
-    manifest_files = [f for f in file_list if _is_manifest_file(os.path.basename(f))]
-    code_files = [f for f in file_list if not _is_manifest_file(os.path.basename(f))]
-    scan_files = code_files if code_files else file_list
-    batch_size = _batch_size(len(scan_files))
-    batches = [scan_files[i: i + batch_size] for i in range(0, len(scan_files), batch_size)]
+    batch_size = _batch_size(len(file_list))
+    batches = [file_list[i: i + batch_size] for i in range(0, len(file_list), batch_size)]
     logger.info(
-        "Files: %d total (%d code, %d manifest) → %d batch(es) of ≤%d",
-        len(file_list), len(code_files), len(manifest_files), len(batches), batch_size,
+        "Files: %d total → %d batch(es); mcp_server drops dependency manifests "
+        "from AIonizer/eval and sends them to CLI Integration",
+        len(file_list), len(batches),
     )
 
     # Step 2: MCP scan
@@ -2523,7 +2848,6 @@ def _execute_scan(args: argparse.Namespace) -> int:
             run_id=run_id,
             server_url=server_url,
             bearer_getter=bearer_getter,
-            manifest_files=manifest_files or None,
         )
 
     elapsed = time.perf_counter() - scan_start
